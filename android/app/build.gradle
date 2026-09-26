@@ -1,0 +1,63 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace "com.sunmiprint.app"
+    compileSdk flutter.compileSdkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    ndkVersion flutter.ndkVersion
+
+    signingConfigs {
+        release {
+            storeFile file(System.getenv("KEYSTORE_PATH") ?: "keystore.jks")
+            storePassword System.getenv("KEYSTORE_PASSWORD") ?: ''
+            keyAlias System.getenv("KEY_ALIAS") ?: ''
+            keyPassword System.getenv("KEY_PASSWORD") ?: ''
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.sunmiprint.app"
+        minSdk 24
+        targetSdk 35
+        versionCode 14
+        versionName "1.0.13"
+    }
+
+    buildTypes {
+        release {
+            def releaseKeystore = file(System.getenv("KEYSTORE_PATH") ?: "keystore.jks")
+            if (releaseKeystore.exists()) {
+                signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
+            }
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+}

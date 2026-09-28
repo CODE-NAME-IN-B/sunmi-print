@@ -16,6 +16,40 @@ subprojects {
     project.evaluationDependsOn(':app')
 }
 
+// flutter_bluetooth_serial 0.4.0 was published in 2021 and predates the app.
+// This has to live in the project: editing the copy in the pub cache makes a
+// local build pass and leaves CI broken, because CI fetches a pristine archive.
+//
+//   namespace     AGP 8 refuses to configure a module without one. The plugin
+//                 already names its Java package as its Gradle group, so that
+//                 is reused rather than invented: the value has to match the
+//                 package its classes live in, or R8 and the manifest merger
+//                 disagree about the merged manifest.
+//
+//   compileSdk    The plugin pins 30, but its appcompat dependency references
+//                 android:attr/lStar, which only exists from API 31, so
+//                 resource linking fails. 34 clears it and stays well below
+//                 the app's own compileSdk.
+//
+// `androidComponents.finalizeDsl` is the hook for this: it runs after the
+// module's own `android { }` block has been evaluated, so it can override what
+// the plugin asked for, but before AGP creates the variant builder, which is
+// when a missing namespace is fatal. Setting the namespace at plugin-apply time
+// is too early (the plugin overwrites it) and afterEvaluate is too late (AGP
+// has already failed). `compileSdk` has the same timing constraint.
+subprojects { subproject ->
+    subproject.plugins.withId('com.android.library') {
+        subproject.androidComponents.finalizeDsl { ext ->
+            if (ext.namespace == null) {
+                ext.namespace = subproject.group
+            }
+            if ((ext.compileSdk ?: 0) < 34) {
+                ext.compileSdk = 34
+            }
+        }
+    }
+}
+
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }

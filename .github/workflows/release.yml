@@ -31,7 +31,9 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # Keep in step with .github/workflows/ci.yml. See the note there:
+          # the Gradle version in android/ constrains which Flutter can be used.
+          flutter-version: 3.35.5
           cache: true
 
       - name: Resolve dependencies
@@ -40,19 +42,48 @@ jobs:
       - name: Generate localizations
         run: flutter gen-l10n
 
+      # Gradle only complains about this once it has resolved the whole
+      # toolchain, which is a slow way to find out that the pinned versions do
+      # not go together. Fail here instead.
+      - name: Check the Flutter and Gradle versions line up
+        run: |
+          set -euo pipefail
+          wrapper=$(sed -n 's|.*gradle-\([0-9.]*\)-.*|\1|p' \
+            android/gradle/wrapper/gradle-wrapper.properties)
+          flutter_version=$(flutter --version --machine \
+            | sed -n 's/.*"frameworkVersion": *"\([^"]*\)".*/\1/p')
+          echo "Flutter $flutter_version, Gradle $wrapper"
+          if [ "$flutter_version" != "3.35.5" ]; then
+            echo "::error file=android/gradle/wrapper/gradle-wrapper.properties::\
+              This workflow is pinned to Flutter 3.35.5 but found \
+              $flutter_version. Upgrade android/gradle/wrapper to \
+              $([ "${flutter_version%%.*}" -ge 3 ] && echo 8.14 || echo 8.12) \
+              and the AGP version in android/settings.gradle, then update the \
+              flutter-version pin in .github/workflows/."
+            exit 1
+          fi
+
       - name: Build universal release APK
         run: |
           flutter build apk --release \
             --obfuscate \
             --split-debug-info=build/symbols
 
-      # The updater in the app looks for an asset with this exact name, so the
-      # release step has to publish it under that name rather than the
-      # versioned default.
-      - name: Publish artefact under the name the updater expects
+      # Gradle 8.12 with the current AGP writes the APK under build/android,
+      # and Flutter's own lookup has moved between the two layouts across
+      # versions. Take it from wherever it landed rather than assuming.
+      - name: Collect the APK
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/app-release.apk dist/app-release.apk
+          apk=$(find build -name 'app-release.apk' -type f | head -1)
+          if [ -z "$apk" ]; then
+            echo "::error::No app-release.apk was produced by the build"
+            exit 1
+          fi
+          echo "Found $apk ($(du -h "$apk" | cut -f1))"
+          # The updater in the app fetches an asset with this exact name.
+          cp "$apk" dist/app-release.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

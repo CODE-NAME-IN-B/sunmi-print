@@ -20,7 +20,13 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # Pinned, not `channel: stable`. A release must not change toolchain
+          # from one day to the next, and the project is on Gradle 8.12 /
+          # AGP 8.9.1, which newer stable Flutter rejects outright
+          # ("Gradle version is lower than Flutter's minimum"). Bump this
+          # together with android/gradle/wrapper and the AGP version in
+          # android/settings.gradle.
+          flutter-version: 3.35.5
           cache: true
 
       - name: Resolve dependencies

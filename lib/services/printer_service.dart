@@ -621,7 +621,10 @@ class PrinterService {
         ),
         settings: settings,
       );
-      return printRaster(
+      // Awaited, not returned: returning the future from inside a try block
+      // lets a print failure escape this catch, and the caller would be told
+      // the line printed when it did not.
+      return await printRaster(
         bitmapData: raster.bitmapData,
         pixelWidth: raster.width,
       );

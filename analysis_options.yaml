@@ -1,5 +1,13 @@
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  exclude:
+    # Published sources carrying local patches, kept in step by
+    # tool/verify_vendor_patches.sh. Linting them would only report their
+    # upstream style, which this project does not own, and would make it
+    # ambiguous whether an issue is ours or theirs.
+    - third_party/**
+
 linter:
   rules:
     prefer_const_constructors: true

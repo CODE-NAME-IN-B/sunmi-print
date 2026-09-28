@@ -32,6 +32,12 @@ jobs:
       - name: Resolve dependencies
         run: flutter pub get
 
+      # Cheap, and it fails the moment a vendored patch stops matching the
+      # archive it claims to come from. Needs network, so it runs before the
+      # analysis steps rather than being folded into them.
+      - name: Verify vendored package patches
+        run: tool/verify_vendor_patches.sh
+
       - name: Verify formatting
         run: dart format --output=none --set-exit-if-changed lib test
 

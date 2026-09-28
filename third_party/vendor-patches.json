@@ -1,0 +1,20 @@
+{
+  "pdf_render": {
+    "version": "1.4.12",
+    "sha256": "bacd2ad8f4f4c9821827003065f5c2f9ca474dd418ff29c68272aab4c0e1e88b",
+    "remove_paths": [
+      "example",
+      "images",
+      "ios",
+      "macos",
+      "test"
+    ],
+    "edits": [
+      {
+        "file": "android/src/main/kotlin/jp/espresso3389/pdf_render/PdfRenderPlugin.kt",
+        "find": "import io.flutter.plugin.common.PluginRegistry.Registrar\n",
+        "reason": "Registrar was removed from the Flutter engine. The import is unused, so removing it is inert. Without this the Kotlin compile fails with 'Unresolved reference Registrar' and no release build is possible."
+      }
+    ]
+  }
+}

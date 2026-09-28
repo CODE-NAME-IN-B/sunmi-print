@@ -56,3 +56,10 @@ app.*.map.json
 # Android build outputs
 local.properties
 android/build/
+android/.kotlin/
+
+# Native build output from NDK and CMake. Vendored plugin sources under
+# third_party/ are compiled in place, so their intermediates land inside the
+# repository rather than under /build/.
+**/.cxx/
+.cxx/

@@ -32,6 +32,15 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^5.0.0
 
+# pdf_render 1.4.12 is the last release and imports PluginRegistry.Registrar,
+# which the Flutter engine no longer has, so its Kotlin source does not compile.
+# There is no fixed version to move to, so the patched source is vendored. See
+# third_party/README.md, and run tool/verify_vendor_patches.sh to confirm the
+# vendored copy still matches the archive apart from that one import.
+dependency_overrides:
+  pdf_render:
+    path: third_party/pdf_render
+
 flutter:
   uses-material-design: true
   generate: true

@@ -45,19 +45,25 @@ class _HistoryScreenState extends ConsumerState<HistoryScreen> {
                     width: 80,
                     height: 80,
                     decoration: BoxDecoration(
-                      color: colorScheme.onSurfaceVariant.withValues(alpha: 0.08),
+                      color: colorScheme.onSurfaceVariant.withValues(
+                        alpha: 0.08,
+                      ),
                       shape: BoxShape.circle,
                     ),
                     child: Icon(
                       Icons.history_rounded,
                       size: 40,
-                      color: colorScheme.onSurfaceVariant.withValues(alpha: 0.4),
+                      color: colorScheme.onSurfaceVariant.withValues(
+                        alpha: 0.4,
+                      ),
                     ),
                   ),
                   const SizedBox(height: 16),
                   Text(
                     'لا يوجد سجل طباعة',
-                    style: theme.textTheme.titleMedium?.copyWith(color: colorScheme.onSurfaceVariant),
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
@@ -73,7 +79,10 @@ class _HistoryScreenState extends ConsumerState<HistoryScreen> {
               return Card(
                 margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                 child: ListTile(
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 4,
+                  ),
                   leading: Container(
                     width: 44,
                     height: 44,
@@ -87,14 +96,19 @@ class _HistoryScreenState extends ConsumerState<HistoryScreen> {
                     job.fileName,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                   subtitle: Padding(
                     padding: const EdgeInsets.only(top: 4),
                     child: Row(
                       children: [
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
                           decoration: BoxDecoration(
                             color: statusColor.withValues(alpha: 0.1),
                             borderRadius: BorderRadius.circular(6),
@@ -118,9 +132,14 @@ class _HistoryScreenState extends ConsumerState<HistoryScreen> {
                     ),
                   ),
                   trailing: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
                     decoration: BoxDecoration(
-                      color: colorScheme.primaryContainer.withValues(alpha: 0.3),
+                      color: colorScheme.primaryContainer.withValues(
+                        alpha: 0.3,
+                      ),
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(

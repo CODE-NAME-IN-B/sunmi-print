@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:pdf_render/pdf_render.dart';
+
 import 'package:image/image.dart' as img;
+import 'package:pdf_render/pdf_render.dart';
+
+import '../constants/app_constants.dart';
 import 'bitmap_utils.dart';
 
 class PdfRenderResult {
@@ -24,62 +27,79 @@ class PdfRenderResult {
 class PdfRenderer {
   PdfRenderer._();
 
-  static const int defaultDpi = 203;
+  static const int defaultDpi = AppConstants.pdfDefaultDpi;
 
+  /// Renders each page of [filePath] as a 1-bit buffer sized for the printhead.
+  ///
+  /// Pages are yielded one at a time and the native render handle is released
+  /// immediately afterwards, so a 200 page document never holds more than one
+  /// page of pixels in memory.
   static Stream<PdfRenderResult> renderPages({
     required String filePath,
     int dpi = defaultDpi,
-    int printerWidthPx = 384,
+    int printerWidthPx = AppConstants.printWidth58mm,
+    bool applyDithering = true,
     int startPage = 0,
   }) async* {
     final file = File(filePath);
+    if (!await file.exists()) {
+      throw StateError('ملف PDF غير موجود: $filePath');
+    }
+
     final pdfDoc = await PdfDocument.openFile(file.path);
     final int totalPages = pdfDoc.pageCount;
+    final int safeStart = startPage.clamp(0, totalPages);
 
     try {
-      for (int i = startPage; i < totalPages; i++) {
+      for (int i = safeStart; i < totalPages; i++) {
         final page = await pdfDoc.getPage(i + 1);
-        final render = await page.render(
-          width: (page.width * dpi / 72).round(),
-          height: (page.height * dpi / 72).round(),
-        );
+        PdfPageImage? render;
+        try {
+          render = await page.render(
+            width: (page.width * dpi / 72).round(),
+            height: (page.height * dpi / 72).round(),
+          );
 
-        final rawBytes = render.pixels;
-        final decoded = img.Image.fromBytes(
-          width: render.width,
-          height: render.height,
-          bytes: rawBytes.buffer,
-          numChannels: 4,
-        );
+          final decoded = img.Image.fromBytes(
+            width: render.width,
+            height: render.height,
+            bytes: render.pixels.buffer,
+            numChannels: 4,
+          );
 
-        final gray = img.grayscale(decoded);
+          final gray = img.grayscale(decoded);
+          final targetWidth = printerWidthPx.clamp(
+            AppConstants.minPixelWidth,
+            AppConstants.maxPixelWidth,
+          );
 
-        final double aspectRatio = gray.width / gray.height;
-        final int targetWidth = printerWidthPx;
-        final int targetHeight = (targetWidth / aspectRatio).round();
+          var scale = targetWidth / gray.width;
+          var targetHeight = (gray.height * scale).round();
+          if (targetHeight > AppConstants.maxPrintHeightPx) {
+            scale *= AppConstants.maxPrintHeightPx / targetHeight;
+            targetHeight = AppConstants.maxPrintHeightPx;
+          }
+          if (targetHeight < 1) targetHeight = 1;
 
-        final resized = img.copyResize(
-          gray,
-          width: targetWidth,
-          height: targetHeight,
-          interpolation: img.Interpolation.linear,
-        );
+          final resized = img.copyResize(
+            gray,
+            width: targetWidth,
+            height: targetHeight,
+            interpolation: img.Interpolation.average,
+          );
 
-        final dithered = floydSteinbergDither(resized);
+          final bitmapData = toOneBit(resized, dither: applyDithering);
 
-        final int w = dithered.width;
-        final int h = dithered.height;
-        final Uint8List bitmapData = bitmapToBytes(dithered);
-
-        render.dispose();
-
-        yield PdfRenderResult(
-          pageNumber: i + 1,
-          totalPages: totalPages,
-          bitmapData: bitmapData,
-          width: w,
-          height: h,
-        );
+          yield PdfRenderResult(
+            pageNumber: i + 1,
+            totalPages: totalPages,
+            bitmapData: bitmapData,
+            width: targetWidth,
+            height: targetHeight,
+          );
+        } finally {
+          render?.dispose();
+        }
       }
     } finally {
       await pdfDoc.dispose();

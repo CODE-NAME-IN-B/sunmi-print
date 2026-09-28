@@ -1,0 +1,91 @@
+name: Release
+
+# A tagged push is the only trigger that publishes an APK. Everything else is
+# a build check, so a broken main never produces a downloadable release.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, for example v1.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Generate localizations
+        run: flutter gen-l10n
+
+      - name: Build universal release APK
+        run: |
+          flutter build apk --release \
+            --obfuscate \
+            --split-debug-info=build/symbols
+
+      # The updater in the app looks for an asset with this exact name, so the
+      # release step has to publish it under that name rather than the
+      # versioned default.
+      - name: Publish artefact under the name the updater expects
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk dist/app-release.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: dist/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-symbols
+          path: build/symbols
+          if-no-files-found: ignore
+
+      - name: Attach APK to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/app-release.apk
+          generate_release_notes: true
+          body: |
+            ## SunmiPrint ${{ github.ref_name }}
+
+            | Asset | Description |
+            | --- | --- |
+            | `app-release.apk` | Universal release APK, install directly on any device |
+
+            ### Install
+
+            ```
+            adb install -r app-release.apk
+            ```
+
+            Or download the APK on the device and open it with
+            "Install unknown apps" enabled.

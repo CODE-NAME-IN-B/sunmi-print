@@ -7,6 +7,7 @@ import 'screens/print_queue_screen.dart';
 import 'screens/print_history_screen.dart';
 import 'screens/receipt_editor_screen.dart';
 import 'screens/bluetooth_discovery_screen.dart';
+import 'screens/printer_settings_screen.dart';
 import 'screens/about_screen.dart';
 import 'screens/preview_screen.dart';
 
@@ -34,15 +35,26 @@ class SunmiPrintApp extends StatelessWidget {
           case '/queue':
             return MaterialPageRoute(builder: (_) => const PrintQueueScreen());
           case '/receipt-editor':
-            return MaterialPageRoute(builder: (_) => const ReceiptEditorScreen());
+            return MaterialPageRoute(
+              builder: (_) => const ReceiptEditorScreen(),
+            );
           case '/history':
             return MaterialPageRoute(builder: (_) => const HistoryScreen());
           case '/bluetooth':
-            return MaterialPageRoute(builder: (_) => const BluetoothDiscoveryScreen());
+            return MaterialPageRoute(
+              builder: (_) => const BluetoothDiscoveryScreen(),
+            );
+          case '/printer-settings':
+            return MaterialPageRoute(
+              builder: (_) => const PrinterSettingsScreen(),
+            );
           case '/about':
             return MaterialPageRoute(builder: (_) => const AboutScreen());
           case '/preview':
-            return MaterialPageRoute(builder: (_) => const PreviewScreen(), settings: settings);
+            return MaterialPageRoute(
+              builder: (_) => const PreviewScreen(),
+              settings: settings,
+            );
           default:
             return MaterialPageRoute(builder: (_) => const HomeScreen());
         }

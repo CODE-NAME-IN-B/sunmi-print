@@ -26,20 +26,26 @@ class UpdateService {
       final packageInfo = await PackageInfo.fromPlatform();
       final currentVersion = packageInfo.version;
 
-      final response = await http.get(
-        Uri.parse(AppConstants.githubReleasesUrl),
-        headers: {'Accept': 'application/vnd.github.v3+json'},
-      ).timeout(_httpTimeout);
+      final response = await http
+          .get(
+            Uri.parse(AppConstants.githubReleasesUrl),
+            headers: {'Accept': 'application/vnd.github.v3+json'},
+          )
+          .timeout(_httpTimeout);
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
-        final tagName = data['tag_name'] as String? ?? '1.0.0';
-        final latestVersion = tagName.replaceAll('v', '');
+        final tagName = data['tag_name'] as String? ?? AppConstants.appVersion;
+        // Tags are published as `v1.1.0`; only a leading `v` is a prefix.
+        // Stripping every `v` would corrupt a word such as `preview`.
+        final latestVersion = tagName.startsWith('v')
+            ? tagName.substring(1)
+            : tagName;
         final downloadUrl =
             (data['assets'] as List<dynamic>?)?.isNotEmpty == true
-                ? (data['assets'] as List<dynamic>).first['browser_download_url']
-                    as String
-                : '${AppConstants.downloadBaseUrl}/app-release.apk';
+            ? (data['assets'] as List<dynamic>).first['browser_download_url']
+                  as String
+            : '${AppConstants.downloadBaseUrl}/app-release.apk';
 
         final hasUpdate = _compareVersions(latestVersion, currentVersion) > 0;
 

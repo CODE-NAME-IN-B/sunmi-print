@@ -1,509 +1,889 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart' as spp;
+import 'package:hive/hive.dart';
 import 'package:sunmi_printer_plus/sunmi_printer_plus.dart';
+
+import '../core/constants/app_constants.dart';
+import '../core/utils/bitmap_utils.dart';
+import '../core/utils/receipt_rasterizer.dart';
+import '../models/printer_profile.dart';
+import '../models/printer_settings.dart';
+import '../models/receipt_document.dart';
+
+/// How the app reaches the printhead.
+enum PrinterTransport {
+  /// Nothing is connected yet.
+  none,
+
+  /// The printer is part of the device, reached over the vendor AIDL service.
+  sunmiSdk,
+
+  /// An external printer reached over a Bluetooth Classic RFCOMM socket.
+  bluetoothClassic,
+}
+
+/// Why a Bluetooth Classic connection attempt failed.
+enum BluetoothConnectError {
+  unsupported,
+  disabled,
+  permissionDenied,
+  unreachable,
+  unknown,
+}
+
+/// Outcome of a Bluetooth Classic connection attempt, carrying the number of
+/// attempts so the UI can explain a slow success honestly.
+class BluetoothConnectResult {
+  const BluetoothConnectResult.success(this.attempts)
+    : success = true,
+      error = null;
+
+  const BluetoothConnectResult.failure(this.error, this.attempts)
+    : success = false;
+
+  final bool success;
+  final BluetoothConnectError? error;
+  final int attempts;
+
+  String get messageAr => switch (error) {
+    BluetoothConnectError.unsupported => 'الجهاز لا يدعم البلوتوث',
+    BluetoothConnectError.disabled => 'البلوتوث غير مفعّل',
+    BluetoothConnectError.permissionDenied =>
+      'يرجى منح صلاحيات البلوتوث من إعدادات التطبيق',
+    BluetoothConnectError.unreachable =>
+      'تعذر الوصول إلى الطابعة — تأكد أنها مقترنة、通ريبة وتشتغل',
+    BluetoothConnectError.unknown => 'فشل الاتصال بالطابعة',
+    null => '',
+  };
+}
 
 enum PrinterConnectionStatus {
   connected,
   disconnected,
+
+  /// The head reports no paper.
   noPaper,
+
+  /// The head is above its safe temperature.
   overheat,
+
+  /// Paper is loaded but will not feed.
+  paperJam,
+
   error,
 }
 
+/// The single place that knows how bytes reach the printhead.
+///
+/// Two transports, tried in a fixed order of preference:
+///
+/// 1. **On-device SDK** (AIDL). A local binder call to the printer service
+///    that ships with the device. No Bluetooth stack, no byte encoding, no
+///    pairing. This is the fast and reliable path on genuine Sunmi hardware.
+/// 2. **Bluetooth Classic** (RFCOMM / SPP). The fallback, used when the SDK is
+///    unavailable, when the user explicitly asks for an external printer, and
+///    for every non-Sunmi thermal printer.
+///
+/// Every printable payload crosses both transports as a raster. Text never
+/// leaves the app as characters, which is what makes Arabic immune to codepage
+/// mismatches.
 class PrinterService {
   PrinterService._();
+
   static final PrinterService instance = PrinterService._();
 
+  // ---------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------
+
   PrinterConnectionStatus _status = PrinterConnectionStatus.disconnected;
-  BluetoothDevice? _bleDevice;
-  BluetoothCharacteristic? _bleChar;
-  bool _isUsingBle = false;
+  PrinterTransport _transport = PrinterTransport.none;
+  PrinterProfile _profile = const PrinterProfile();
 
   spp.BluetoothConnection? _sppConnection;
+  StreamSubscription<dynamic>? _sppCloseWatch;
   String _sppDeviceName = '';
   String _sppDeviceAddress = '';
-  bool _isUsingSpp = false;
-
-  PrinterConnectionStatus get status => _status;
-  bool get isConnected {
-    if (_isUsingSpp) return _sppConnection?.isConnected == true;
-    if (_isUsingBle) return _bleDevice?.isConnected == true;
-    return _status == PrinterConnectionStatus.connected;
-  }
-  bool get isUsingBle => _isUsingBle;
-  bool get isUsingSpp => _isUsingSpp;
-  BluetoothDevice? get bleDevice => _bleDevice;
-  String get sppDeviceName => _sppDeviceName;
-  String get sppDeviceAddress => _sppDeviceAddress;
+  bool _isSending = false;
 
   final StreamController<PrinterConnectionStatus> _statusController =
       StreamController<PrinterConnectionStatus>.broadcast();
+  final StreamController<PrinterTransport> _transportController =
+      StreamController<PrinterTransport>.broadcast();
+  final StreamController<PrinterProfile> _profileController =
+      StreamController<PrinterProfile>.broadcast();
 
   Stream<PrinterConnectionStatus> get statusStream => _statusController.stream;
+  Stream<PrinterTransport> get transportStream => _transportController.stream;
+  Stream<PrinterProfile> get profileStream => _profileController.stream;
 
-  static const Duration _printTimeout = Duration(seconds: 30);
-  static const Duration _statusTimeout = Duration(seconds: 10);
+  PrinterConnectionStatus get status => _status;
+  PrinterTransport get transport => _transport;
+  PrinterProfile get profile => _profile;
+  String get deviceName => _transport == PrinterTransport.sunmiSdk
+      ? 'Sunmi المدمجة'
+      : _sppDeviceName;
+  String get deviceAddress => _sppDeviceAddress;
+  SavedPrinter? get savedPrinter => _profile.bluetoothPrinter;
+  bool get isUsingSunmiSdk => _transport == PrinterTransport.sunmiSdk;
+  bool get isUsingBluetooth => _transport == PrinterTransport.bluetoothClassic;
 
-  void setBleDevice(BluetoothDevice device) {
-    _bleDevice = device;
-    _isUsingBle = true;
-    _bleChar = null; // Reset cached char, will discover on first print
-    _status = PrinterConnectionStatus.connected;
-    _statusController.add(_status);
-  }
-
-  void clearBleDevice() {
-    _bleDevice = null;
-    _bleChar = null;
-    _isUsingBle = false;
-    _status = PrinterConnectionStatus.disconnected;
-    _statusController.add(_status);
-  }
-
-  void setSppConnection(spp.BluetoothConnection connection, String deviceName, {String address = ''}) {
-    _sppConnection = connection;
-    _sppDeviceName = deviceName;
-    _sppDeviceAddress = address;
-    _isUsingSpp = true;
-    _status = PrinterConnectionStatus.connected;
-    _statusController.add(_status);
-  }
-
-  void clearSppConnection() {
-    _sppConnection?.dispose();
-    _sppConnection = null;
-    _sppDeviceName = '';
-    _sppDeviceAddress = '';
-    _isUsingSpp = false;
-    _status = PrinterConnectionStatus.disconnected;
-    _statusController.add(_status);
-  }
-
-  Future<bool> reconnectSpp() async {
-    if (_sppDeviceAddress.isEmpty) return false;
-    try {
-      final connection = await spp.BluetoothConnection.toAddress(_sppDeviceAddress);
-      _sppConnection?.dispose();
-      _sppConnection = connection;
-      _isUsingSpp = true;
-      _status = PrinterConnectionStatus.connected;
-      _statusController.add(_status);
-      return true;
-    } catch (e) {
-      debugPrint('PrinterService: SPP reconnect failed: $e');
-      _sppConnection = null;
-      _status = PrinterConnectionStatus.disconnected;
-      _statusController.add(_status);
-      return false;
+  /// True when a printhead is reachable, either transport.
+  bool get isConnected {
+    if (_transport == PrinterTransport.bluetoothClassic) {
+      return _sppConnection?.isConnected == true;
     }
-  }
-
-  Future<BluetoothCharacteristic?> _getBleChar() async {
-    if (_bleChar != null) return _bleChar;
-    if (_bleDevice == null) return null;
-    try {
-      final services = await _bleDevice!.discoverServices();
-      for (final service in services) {
-        for (final char in service.characteristics) {
-          if (char.properties.write) {
-            _bleChar = char;
-            return char;
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint('PrinterService: Failed to discover BLE services: $e');
-    }
-    return null;
-  }
-
-  Future<bool> initialize() async {
-    try {
-      final bound = await SunmiPrinterPlus().rebindPrinter();
-      if (bound) {
-        await _updateStatus();
-        return true;
-      }
-    } catch (e) {
-      _status = PrinterConnectionStatus.disconnected;
-      _statusController.add(_status);
+    if (_transport == PrinterTransport.sunmiSdk) {
+      return _status == PrinterConnectionStatus.connected;
     }
     return false;
   }
 
-  Future<String> getPrinterWidth() async {
-    try {
-      final paper = await SunmiConfig.getPaper();
-      if (paper != null) {
-        if (paper.contains('58') || paper.contains('57')) return 'mm58';
-        if (paper.contains('80')) return 'mm80';
+  /// A human readable description of the active link, shown in the banner.
+  String get transportLabelAr => switch (_transport) {
+    PrinterTransport.sunmiSdk => 'الطابعة المدمجة (SDK)',
+    PrinterTransport.bluetoothClassic => 'بلوتوث كلاسيكي',
+    PrinterTransport.none => 'لا يوجد مسار طباعة',
+  };
+
+  // ---------------------------------------------------------------------
+  // Startup
+  // ---------------------------------------------------------------------
+
+  /// Establishes a print path.
+  ///
+  /// The on-device SDK is always tried first, silently, because when it works
+  /// it removes every failure mode the Bluetooth path has. Bluetooth is only
+  /// attempted when the SDK refuses, when no internal printer exists, or when
+  /// the user pinned the app to an external printer.
+  Future<PrinterTransport> initialize() async {
+    await _loadProfile();
+
+    if (_profile.transportPreference != TransportPreference.bluetoothClassic) {
+      if (await _tryBindSunmiSdk()) {
+        return _transport;
       }
-    } catch (e) {
-      debugPrint('PrinterService: Failed to detect printer width: $e');
     }
-    return 'mm58';
+
+    if (_profile.transportPreference != TransportPreference.sunmiSdk &&
+        _profile.hasBluetoothPrinter) {
+      final result = await connectBluetooth(
+        _profile.bluetoothPrinter!.name,
+        _profile.bluetoothPrinter!.address,
+        attempts: AppConstants.connectionRetryAttempts,
+        persist: false,
+      );
+      if (result.success) return _transport;
+    }
+
+    _setStatus(PrinterConnectionStatus.disconnected);
+    _setTransport(PrinterTransport.none);
+    return _transport;
   }
 
-  Future<bool> printImage({
-    required Uint8List bitmapData,
+  /// AIDL binding. A missing service, an incompatible Android version or an
+  /// updated system image all surface here as a `false` or a throw.
+  Future<bool> _tryBindSunmiSdk() async {
+    try {
+      final bound = await SunmiPrinterPlus().rebindPrinter().timeout(
+        const Duration(seconds: 6),
+      );
+      if (bound != true) return false;
+
+      _sppConnection?.dispose();
+      _sppConnection = null;
+      _sppCloseWatch?.cancel();
+      _sppCloseWatch = null;
+      _sppDeviceName = '';
+      _sppDeviceAddress = '';
+
+      _setTransport(PrinterTransport.sunmiSdk);
+      await _updateSunmiStatus();
+      // Binding the service is not the same as having a usable printer: the
+      // status read above can discover the printhead is unreachable and drop
+      // the transport back to none. Reporting success here would stop the
+      // caller from falling through to the Bluetooth path.
+      return _transport == PrinterTransport.sunmiSdk;
+    } catch (e) {
+      debugPrint('PrinterService: AIDL binding unavailable: $e');
+      return false;
+    }
+  }
+
+  /// Reads the on-device printer width so the settings screen can preselect a
+  /// roll size instead of making the user guess. Returns millimetres, or null
+  /// when the vendor service cannot report it.
+  Future<int?> detectSunmiPaperWidthMm() async {
+    if (_transport != PrinterTransport.sunmiSdk) return null;
+    try {
+      final paper = await SunmiConfig.getPaper().timeout(
+        AppConstants.sunmiStatusTimeout,
+      );
+      if (paper == null) return null;
+      final match = RegExp(r'(\d{2,3})').firstMatch(paper);
+      if (match == null) return null;
+      final reported = int.tryParse(match.group(1)!);
+      if (reported == null || reported < 20 || reported > 120) return null;
+      // Roll width in, printable width out.
+      return switch (reported) {
+        58 => AppConstants.printableWidth58mm,
+        80 => AppConstants.printableWidth80mm,
+        100 => AppConstants.printableWidth100mm,
+        _ => null,
+      };
+    } catch (e) {
+      debugPrint('PrinterService: paper detection failed: $e');
+      return null;
+    }
+  }
+
+  Future<void> _updateSunmiStatus() async {
+    if (_transport != PrinterTransport.sunmiSdk) return;
+    try {
+      final statusStr = await SunmiConfig.getStatus().timeout(
+        AppConstants.sunmiStatusTimeout,
+      );
+      if (statusStr == null) {
+        _setStatus(PrinterConnectionStatus.disconnected);
+        _setTransport(PrinterTransport.none);
+        return;
+      }
+      final lower = statusStr.toLowerCase();
+      if (lower.contains('ready') ||
+          lower.contains('normal') ||
+          lower.contains('printing') ||
+          lower.contains('idle')) {
+        _setStatus(PrinterConnectionStatus.connected);
+      } else if (lower.contains('paper') || lower.contains('nepaper')) {
+        _setStatus(PrinterConnectionStatus.noPaper);
+      } else if (lower.contains('hot') ||
+          lower.contains('overheat') ||
+          lower.contains('thermal')) {
+        _setStatus(PrinterConnectionStatus.overheat);
+      } else {
+        _setStatus(PrinterConnectionStatus.error);
+      }
+    } catch (e) {
+      debugPrint('PrinterService: status read failed: $e');
+      _setStatus(PrinterConnectionStatus.disconnected);
+      _setTransport(PrinterTransport.none);
+    }
+  }
+
+  /// Re-reads the on-device printer state. No-op on Bluetooth, where liveness
+  /// is observed from the socket.
+  Future<void> refreshStatus() async {
+    if (_transport == PrinterTransport.sunmiSdk) {
+      await _updateSunmiStatus();
+    } else if (_transport == PrinterTransport.bluetoothClassic) {
+      if (_sppConnection?.isConnected != true) {
+        _setStatus(PrinterConnectionStatus.disconnected);
+      }
+    }
+  }
+
+  /// Used by the desktop and test builds where no printhead exists.
+  void simulateConnected() {
+    _setTransport(PrinterTransport.sunmiSdk);
+    _setStatus(PrinterConnectionStatus.connected);
+  }
+
+  // ---------------------------------------------------------------------
+  // Bluetooth Classic
+  // ---------------------------------------------------------------------
+
+  /// Opens an RFCOMM socket to [address].
+  ///
+  /// The first attempt plus [attempts] - 1 automatic retries. Cheap receipt
+  /// printers park their radio in a sleep state and refuse the first channel
+  /// open after power on, so a single failed attempt is not evidence that the
+  /// printer is unreachable.
+  Future<BluetoothConnectResult> connectBluetooth(
+    String name,
+    String address, {
+    int attempts = AppConstants.connectionRetryAttempts,
+    bool persist = true,
+  }) async {
+    if (address.trim().isEmpty) {
+      return const BluetoothConnectResult.failure(
+        BluetoothConnectError.unreachable,
+        0,
+      );
+    }
+
+    for (int attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await _closeSpp();
+
+        final connection = await spp.BluetoothConnection.toAddress(
+          address,
+        ).timeout(AppConstants.sppCommandTimeout);
+
+        if (connection.isConnected) {
+          _sppConnection = connection;
+          _sppDeviceName = name.isEmpty ? address : name;
+          _sppDeviceAddress = address;
+          _watchRemoteClose(connection);
+
+          _setTransport(PrinterTransport.bluetoothClassic);
+          _setStatus(PrinterConnectionStatus.connected);
+
+          if (persist) {
+            await setBluetoothPrinter(name, address);
+            await setTransportPreference(TransportPreference.bluetoothClassic);
+          }
+          return BluetoothConnectResult.success(attempt);
+        }
+
+        await connection.close();
+      } catch (e) {
+        debugPrint(
+          'PrinterService: SPP attempt $attempt to $address failed: $e',
+        );
+      }
+
+      if (attempt < attempts) {
+        // Back off linearly so the second try lands after the radio settles.
+        await Future<void>.delayed(AppConstants.connectionRetryDelay * attempt);
+      }
+    }
+
+    _setStatus(PrinterConnectionStatus.disconnected);
+    return BluetoothConnectResult.failure(
+      _classifyBluetoothFailure(address),
+      attempts,
+    );
+  }
+
+  BluetoothConnectError _classifyBluetoothFailure(String address) {
+    if (!Platform.isAndroid) return BluetoothConnectError.unsupported;
+    return BluetoothConnectError.unreachable;
+  }
+
+  /// Tears the socket down and reports the printer as gone.
+  Future<void> disconnectBluetooth() async {
+    await _closeSpp();
+    _setTransport(PrinterTransport.none);
+    _setStatus(PrinterConnectionStatus.disconnected);
+  }
+
+  /// Watches the RFCOMM socket so a printer that is switched off mid job is
+  /// noticed immediately instead of surfacing as a silently truncated receipt.
+  void _watchRemoteClose(spp.BluetoothConnection connection) {
+    _sppCloseWatch?.cancel();
+    _sppCloseWatch = connection.input?.listen(
+      (_) {},
+      onError: (Object _) => _onSppLost(),
+      onDone: _onSppLost,
+      cancelOnError: true,
+    );
+  }
+
+  void _onSppLost() {
+    if (_transport != PrinterTransport.bluetoothClassic) return;
+    debugPrint('PrinterService: RFCOMM socket closed by the remote end');
+    _sppConnection = null;
+    _sppCloseWatch?.cancel();
+    _sppCloseWatch = null;
+    _setStatus(PrinterConnectionStatus.disconnected);
+  }
+
+  Future<void> _closeSpp() async {
+    final connection = _sppConnection;
+    _sppConnection = null;
+    _sppCloseWatch?.cancel();
+    _sppCloseWatch = null;
+    if (connection == null) return;
+    try {
+      await connection.close();
+    } catch (_) {
+      // The socket is already gone, which is the state we wanted.
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Profile persistence
+  // ---------------------------------------------------------------------
+
+  Future<void> _loadProfile() async {
+    try {
+      final box = await Hive.openBox<String>(AppConstants.hiveBoxSettings);
+      final raw = box.get(AppConstants.hiveKeyPrinterProfile);
+      if (raw != null) {
+        _profile = PrinterProfile.decode(raw);
+      }
+    } catch (e) {
+      debugPrint('PrinterService: profile load failed: $e');
+    }
+    if (!_profileController.isClosed) _profileController.add(_profile);
+  }
+
+  Future<void> _persistProfile() async {
+    try {
+      final box = await Hive.openBox<String>(AppConstants.hiveBoxSettings);
+      await box.put(AppConstants.hiveKeyPrinterProfile, _profile.encode());
+    } catch (e) {
+      debugPrint('PrinterService: profile save failed: $e');
+    }
+    if (!_profileController.isClosed) _profileController.add(_profile);
+  }
+
+  Future<void> setBluetoothPrinter(String name, String address) async {
+    _profile = _profile.copyWith(
+      bluetoothPrinter: SavedPrinter(
+        name: name,
+        address: address,
+        savedAt: DateTime.now(),
+      ),
+    );
+    await _persistProfile();
+  }
+
+  Future<void> forgetBluetoothPrinter() async {
+    _profile = _profile.copyWith(clearBluetoothPrinter: true);
+    await _persistProfile();
+  }
+
+  Future<void> setTransportPreference(TransportPreference preference) async {
+    _profile = _profile.copyWith(transportPreference: preference);
+    await _persistProfile();
+  }
+
+  /// Drops back to the on-device printer, if there is one.
+  Future<bool> useSunmiSdk() async {
+    await setTransportPreference(TransportPreference.sunmiSdk);
+    await _closeSpp();
+    return _tryBindSunmiSdk();
+  }
+
+  // ---------------------------------------------------------------------
+  // Printing
+  // ---------------------------------------------------------------------
+
+  /// Prints a 1-bit raster, one bit per dot, [pixelWidth] dots wide.
+  ///
+  /// [bitmapData] must be packed exactly as [packOneBit] produces it. The
+  /// height is derived from the payload length, so a 58mm receipt and a 100mm
+  /// receipt of the same content need no extra bookkeeping.
+  Future<bool> printRaster({
+    required List<int> bitmapData,
+    required int pixelWidth,
     int copies = 1,
   }) async {
     if (!isConnected) return false;
+    if (bitmapData.isEmpty) return false;
+
+    final bytesPerRow = (pixelWidth + 7) ~/ 8;
+    if (bytesPerRow == 0 || bitmapData.length % bytesPerRow != 0) {
+      debugPrint(
+        'PrinterService: raster length ${bitmapData.length} is not a '
+        'multiple of the $bytesPerRow byte row for $pixelWidth dots',
+      );
+      return false;
+    }
+    final height = bitmapData.length ~/ bytesPerRow;
 
     try {
-      for (int i = 0; i < copies; i++) {
-        if (_isUsingSpp && _sppConnection != null) {
-          await _printImageSpp(bitmapData);
-        } else if (_isUsingBle && _bleDevice != null) {
-          await _printImageBle(bitmapData);
-        } else {
-          await SunmiPrinter.printImage(bitmapData).timeout(_printTimeout);
+      _isSending = true;
+      for (int copy = 0; copy < copies; copy++) {
+        final success = _transport == PrinterTransport.bluetoothClassic
+            ? await _sendRasterSpp(bitmapData, pixelWidth, height)
+            : await _sendRasterSdk(bitmapData, pixelWidth);
+        if (!success) return false;
+
+        if (copy < copies - 1) {
+          await lineWrap(2);
         }
-        if (i < copies - 1) {
-          if (_isUsingSpp && _sppConnection != null) {
-            await _lineWrapSpp(1);
-          } else if (_isUsingBle && _bleDevice != null) {
-            await _lineWrapBle(1);
-          } else {
-            await SunmiPrinter.lineWrap(1);
-          }
-        }
       }
       return true;
-    } on TimeoutException {
-      if (!_isUsingBle && !_isUsingSpp) {
-        _status = PrinterConnectionStatus.disconnected;
-        _statusController.add(_status);
-      }
-      return false;
     } catch (e) {
-      if (!_isUsingBle && !_isUsingSpp) {
-        await _updateStatus();
-      }
+      debugPrint('PrinterService: raster print failed: $e');
       return false;
+    } finally {
+      _isSending = false;
     }
   }
 
-  Future<bool> printText(String text,
-      {SunmiPrintAlign align = SunmiPrintAlign.LEFT}) async {
+  Future<bool> _sendRasterSdk(List<int> bitmapData, int pixelWidth) async {
+    // The vendor SDK runs the payload through BitmapFactory, so the raster is
+    // wrapped in a bitmap container instead of being sent as raw dots.
+    final bmp = packOneBitBmp(bitmapData, pixelWidth: pixelWidth);
     try {
-      if (_isUsingSpp && _sppConnection != null) {
-        await _printTextSpp(text);
-      } else if (_isUsingBle && _bleDevice != null) {
-        await _printTextBle(text);
-      } else {
-        await SunmiPrinter.printText(text,
-            style: SunmiTextStyle(align: align)).timeout(_printTimeout);
-      }
-      return true;
+      final result = await SunmiPrinter.printImage(
+        bmp,
+        align: SunmiPrintAlign.CENTER,
+      ).timeout(AppConstants.printTimeout);
+      return result != null && result.toLowerCase() != 'invalid';
     } on TimeoutException {
+      _setStatus(PrinterConnectionStatus.disconnected);
+      _setTransport(PrinterTransport.none);
       return false;
     } catch (e) {
+      debugPrint('PrinterService: SDK raster failed: $e');
+      await _updateSunmiStatus();
       return false;
     }
   }
 
-  Future<bool> printQRCode(String data,
-      {int size = 4}) async {
+  Future<bool> _sendRasterSpp(
+    List<int> bitmapData,
+    int pixelWidth,
+    int height,
+  ) async {
+    final bytesPerRow = (pixelWidth + 7) ~/ 8;
     try {
-      if (_isUsingSpp && _sppConnection != null) {
-        await _printQRCodeSpp(data, size: size);
-      } else if (_isUsingBle && _bleDevice != null) {
-        await _printQRCodeBle(data, size: size);
-      } else {
-        await SunmiPrinter.printQRCode(data,
-            style: SunmiQrcodeStyle(qrcodeSize: size)).timeout(_printTimeout);
+      // ESC @ resets any leftover state from a previous job, then the raster
+      // is announced with GS v 0 before the dots follow.
+      await _sendSpp(<int>[0x1B, 0x40]);
+      await _sendSpp(<int>[0x1B, 0x61, 0x01]); // centre align
+
+      await _sendSpp(<int>[
+        0x1D, 0x76, 0x30, 0x00, //
+        bytesPerRow & 0xFF, (bytesPerRow >> 8) & 0xFF,
+        height & 0xFF, (height >> 8) & 0xFF,
+      ]);
+      await _sendSpp(bitmapData);
+      await _sendSpp(<int>[0x1B, 0x64, 0x01]); // one line of feed
+      return true;
+    } catch (e) {
+      debugPrint('PrinterService: SPP raster failed: $e');
+      _onSppLost();
+      return false;
+    }
+  }
+
+  /// Renders [document] and prints it as a raster, then appends the printer
+  /// native QR and barcode symbols.
+  ///
+  /// The raster path is what makes Arabic print correctly. The QR and barcode
+  /// stay as ESC/POS commands because the printhead draws them itself, which
+  /// is both crisper and faster than burning dots for them.
+  Future<bool> printReceipt(
+    ReceiptDocument document, {
+    required PrinterSettings settings,
+    int copies = 1,
+  }) async {
+    if (!isConnected) return false;
+    if (document.isEmpty) return false;
+
+    try {
+      final raster = await ReceiptRasterizer.render(
+        document,
+        settings: settings,
+      );
+      final printed = await printRaster(
+        bitmapData: raster.bitmapData,
+        pixelWidth: raster.width,
+        copies: copies,
+      );
+      if (!printed) return false;
+
+      final qr = document.qrData;
+      if (qr != null && qr.trim().isNotEmpty) {
+        if (!await printQRCode(qr)) return false;
+      }
+      final barcode = document.barcodeData;
+      if (barcode != null && barcode.trim().isNotEmpty) {
+        if (!await printBarcode(barcode)) return false;
+      }
+
+      if (settings.autoCut) {
+        await cutPaper();
       }
       return true;
     } catch (e) {
+      debugPrint('PrinterService: receipt print failed: $e');
       return false;
     }
   }
 
+  /// Prints a single line of text. The text is rasterised, never encoded.
+  Future<bool> printTextLine(
+    String text, {
+    required PrinterSettings settings,
+    ReceiptAlign align = ReceiptAlign.start,
+    bool bold = false,
+  }) async {
+    if (text.trim().isEmpty) return false;
+    if (!isConnected) return false;
+
+    try {
+      final raster = await ReceiptRasterizer.render(
+        ReceiptDocument(
+          lines: <ReceiptLine>[
+            ReceiptLine.text(text, align: align, bold: bold),
+          ],
+        ),
+        settings: settings,
+      );
+      return printRaster(
+        bitmapData: raster.bitmapData,
+        pixelWidth: raster.width,
+      );
+    } catch (e) {
+      debugPrint('PrinterService: text print failed: $e');
+      return false;
+    }
+  }
+
+  /// Prints a stock test page: identity block, geometry, a dithering ramp and
+  /// a QR symbol. Exercises every capability the app relies on.
+  Future<bool> printTestPage({required PrinterSettings settings}) async {
+    final now = DateTime.now();
+    final document = ReceiptDocument(
+      header: 'SunmiPrint',
+      subHeader: settings.paperPreset == PaperPreset.custom
+          ? '${settings.paperWidthMm} مم · ${settings.printerDpi} dpi'
+          : '${settings.paperPreset.rollWidthMm} مم · ${settings.printerDpi} dpi',
+      lines: <ReceiptLine>[
+        const ReceiptLine.rule(ReceiptRule.solid),
+        ReceiptLine.keyValue(
+          'عرض الطباعة',
+          '${settings.pixelWidth} بكسل',
+          bold: true,
+        ),
+        const ReceiptLine.text('اختبار الاتصال والطابعة — انتهى الاختبار'),
+        const ReceiptLine.rule(ReceiptRule.dashed),
+        const ReceiptLine.text('كثافة الطباعة'),
+        const ReceiptLine.text('########  ███  ▓▓▓  ▒▒▒  ····  ....'),
+        const ReceiptLine.text('حروف عربية:receipt · Latin 0123456789'),
+        const ReceiptLine.rule(ReceiptRule.double),
+        ReceiptLine.keyValue(
+          '${now.hour.toString().padLeft(2, '0')}:'
+              '${now.minute.toString().padLeft(2, '0')}',
+          'تم',
+          valueAlign: ReceiptAlign.end,
+        ),
+      ],
+      footer: 'شكراً لتعاملكم معنا',
+      qrData: 'SUNMIPRINT-TEST:${now.millisecondsSinceEpoch}',
+    );
+
+    return printReceipt(document, settings: settings);
+  }
+
+  /// Printer generated QR symbol. Byte safe, so it needs no rasterisation.
+  Future<bool> printQRCode(String data, {int size = 6}) async {
+    if (data.isEmpty) return false;
+    final moduleSize = size.clamp(1, 16);
+    try {
+      if (_transport == PrinterTransport.bluetoothClassic) {
+        final bytes = Uint8List.fromList(utf8.encode(data));
+        final payloadLength = bytes.length + 3;
+        await _sendSpp(<int>[0x1B, 0x40]);
+        await _sendSpp(<int>[0x1B, 0x61, 0x01]);
+        // Model 2.
+        await _sendSpp(<int>[
+          0x1D,
+          0x28,
+          0x6B,
+          0x04,
+          0x00,
+          0x31,
+          0x41,
+          0x32,
+          0x00,
+        ]);
+        // Module size.
+        await _sendSpp(<int>[
+          0x1D,
+          0x28,
+          0x6B,
+          0x03,
+          0x00,
+          0x31,
+          0x43,
+          moduleSize,
+        ]);
+        // Error correction level M.
+        await _sendSpp(<int>[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x31]);
+        // Store the payload, prefixed by the pL/pH length pair.
+        await _sendSpp(<int>[
+          0x1D,
+          0x28,
+          0x6B,
+          payloadLength & 0xFF,
+          (payloadLength >> 8) & 0xFF,
+          0x30,
+          0x50,
+          0x30,
+          ...bytes,
+        ]);
+        // Print from the symbol storage area.
+        await _sendSpp(<int>[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30]);
+        await _sendSpp(<int>[0x1B, 0x64, 0x01]);
+      } else {
+        await SunmiPrinter.printQRCode(
+          data,
+          style: SunmiQrcodeStyle(qrcodeSize: moduleSize),
+        ).timeout(AppConstants.printTimeout);
+      }
+      return true;
+    } catch (e) {
+      debugPrint('PrinterService: QR print failed: $e');
+      return false;
+    }
+  }
+
+  /// CODE 128 barcode with the human readable digits underneath.
   Future<bool> printBarcode(String data) async {
+    if (data.isEmpty) return false;
+    final bytes = Uint8List.fromList(utf8.encode(data));
+    if (bytes.length > 255) return false;
     try {
-      if (_isUsingSpp && _sppConnection != null) {
-        await _printBarcodeSpp(data);
-      } else if (_isUsingBle && _bleDevice != null) {
-        await _printBarcodeBle(data);
+      if (_transport == PrinterTransport.bluetoothClassic) {
+        await _sendSpp(<int>[0x1B, 0x40]);
+        await _sendSpp(<int>[0x1B, 0x61, 0x01]);
+        await _sendSpp(<int>[0x1D, 0x48, 0x02]); // readable text below
+        await _sendSpp(<int>[0x1D, 0x68, 60]); // bar height
+        await _sendSpp(<int>[0x1D, 0x77, 0x02]); // module width
+        await _sendSpp(<int>[0x1D, 0x48, 0x02]);
+        await _sendSpp(<int>[0x1D, 0x6B, 0x49, bytes.length, ...bytes]);
+        await _sendSpp(<int>[0x1B, 0x64, 0x01]);
       } else {
-        await SunmiPrinter.printBarCode(data).timeout(_printTimeout);
+        await SunmiPrinter.printBarCode(
+          data,
+        ).timeout(AppConstants.printTimeout);
       }
       return true;
     } catch (e) {
+      debugPrint('PrinterService: barcode print failed: $e');
       return false;
     }
   }
 
+  /// Advances the paper by [lines] rows.
   Future<bool> lineWrap(int lines) async {
+    final count = lines.clamp(0, 10);
+    if (count == 0) return true;
     try {
-      if (_isUsingSpp && _sppConnection != null) {
-        await _lineWrapSpp(lines);
-      } else if (_isUsingBle && _bleDevice != null) {
-        await _lineWrapBle(lines);
+      if (_transport == PrinterTransport.bluetoothClassic) {
+        await _sendSpp(<int>[0x1B, 0x64, count]);
       } else {
-        await SunmiPrinter.lineWrap(lines).timeout(_printTimeout);
+        await SunmiPrinter.lineWrap(count).timeout(AppConstants.printTimeout);
       }
       return true;
     } catch (e) {
+      debugPrint('PrinterService: line feed failed: $e');
       return false;
     }
   }
 
+  /// Feeds [dots] horizontal motion units, used to position a cut.
+  Future<bool> feed(int dots) async {
+    final count = dots.clamp(0, 255);
+    try {
+      if (_transport == PrinterTransport.bluetoothClassic) {
+        await _sendSpp(<int>[0x1B, 0x4A, count]);
+      } else {
+        await SunmiPrinter.lineWrap(
+          (count / 203).ceil().clamp(1, 10),
+        ).timeout(AppConstants.printTimeout);
+      }
+      return true;
+    } catch (e) {
+      debugPrint('PrinterService: feed failed: $e');
+      return false;
+    }
+  }
+
+  /// Cuts the receipt.
+  ///
+  /// A short feed runs first because most cheap mechanisms need the paper past
+  /// the cutter bar before the blade engages.
   Future<bool> cutPaper() async {
     try {
-      if (_isUsingSpp && _sppConnection != null) {
-        await _cutPaperSpp();
-      } else if (_isUsingBle && _bleDevice != null) {
-        await _cutPaperBle();
+      if (_transport == PrinterTransport.bluetoothClassic) {
+        await _sendSpp(<int>[0x1B, 0x64, 0x04]);
+        await _sendSpp(<int>[0x1D, 0x56, 0x42]); // feed then full cut
       } else {
-        await SunmiPrinter.cutPaper().timeout(_printTimeout);
+        await SunmiPrinter.cutPaper().timeout(AppConstants.printTimeout);
       }
       return true;
     } catch (e) {
+      debugPrint('PrinterService: cut failed: $e');
       return false;
     }
   }
 
-  Future<void> _updateStatus() async {
-    try {
-      final statusStr = await SunmiConfig.getStatus().timeout(_statusTimeout);
-      if (statusStr == null) {
-        _status = PrinterConnectionStatus.disconnected;
-      } else {
-        final lower = statusStr.toLowerCase();
-        if (lower.contains('ready') || lower.contains('normal')) {
-          _status = PrinterConnectionStatus.connected;
-        } else if (lower.contains('paper')) {
-          _status = PrinterConnectionStatus.noPaper;
-        } else if (lower.contains('hot') || lower.contains('overheat')) {
-          _status = PrinterConnectionStatus.overheat;
-        } else {
-          _status = PrinterConnectionStatus.error;
-        }
-      }
-    } catch (e) {
-      _status = PrinterConnectionStatus.disconnected;
-    }
-    _statusController.add(_status);
-  }
+  // ---------------------------------------------------------------------
+  // Raw Bluetooth writes
+  // ---------------------------------------------------------------------
 
-  void simulateConnected() {
-    _status = PrinterConnectionStatus.connected;
-    _statusController.add(_status);
-  }
-
-  // ESC/POS BLE printing helpers
-  Future<void> _printImageBle(Uint8List bitmapData) async {
-    final char = await _getBleChar();
-    if (char == null) return;
-
-    try {
-      // ESC/POS: Initialize
-      await char.write([0x1B, 0x40], withoutResponse: true);
-
-      // ESC/POS: Center align
-      await char.write([0x1B, 0x61, 0x01], withoutResponse: true);
-
-      // ESC/POS: Set image mode and print bitmap
-      final List<int> chunks = [];
-      const int bytesPerLine = (384 + 7) ~/ 8;
-
-      chunks.add(0x1D);
-      chunks.add(0x76);
-      chunks.add(0x30);
-      chunks.add(0x00);
-      chunks.add(bytesPerLine & 0xFF);
-      chunks.add((bytesPerLine >> 8) & 0xFF);
-      chunks.add((bitmapData.length ~/ bytesPerLine) & 0xFF);
-      chunks.add(((bitmapData.length ~/ bytesPerLine) >> 8) & 0xFF);
-
-      for (final byte in bitmapData) {
-        chunks.add(byte);
-      }
-
-      // Write in chunks to avoid BLE MTU issues
-      const int chunkSize = 20;
-      for (int i = 0; i < chunks.length; i += chunkSize) {
-        final end = (i + chunkSize < chunks.length) ? i + chunkSize : chunks.length;
-        await char.write(chunks.sublist(i, end), withoutResponse: true);
-      }
-
-      // ESC/POS: Feed and cut
-      await char.write([0x1B, 0x64, 0x03], withoutResponse: true);
-    } catch (e) {
-      debugPrint('PrinterService: BLE image print failed: $e');
-    }
-  }
-
-  Future<void> _printTextBle(String text) async {
-    final char = await _getBleChar();
-    if (char == null) return;
-
-    try {
-      // ESC/POS: Initialize
-      await char.write([0x1B, 0x40], withoutResponse: true);
-
-      // ESC/POS: Left align
-      await char.write([0x1B, 0x61, 0x00], withoutResponse: true);
-
-      // ESC/POS: Print text
-      final bytes = Uint8List.fromList(text.codeUnits);
-      const int chunkSize = 20;
-      for (int i = 0; i < bytes.length; i += chunkSize) {
-        final end = (i + chunkSize < bytes.length) ? i + chunkSize : bytes.length;
-        await char.write(bytes.sublist(i, end), withoutResponse: true);
-      }
-    } catch (e) {
-      debugPrint('PrinterService: BLE text print failed: $e');
-    }
-  }
-
-  Future<void> _lineWrapBle(int lines) async {
-    final char = await _getBleChar();
-    if (char == null) return;
-
-    try {
-      await char.write([0x1B, 0x64, lines], withoutResponse: true);
-    } catch (e) {
-      debugPrint('PrinterService: BLE line wrap failed: $e');
-    }
-  }
-
-  Future<void> _cutPaperBle() async {
-    final char = await _getBleChar();
-    if (char == null) return;
-
-    try {
-      // ESC/POS: Full cut
-      await char.write([0x1D, 0x56, 0x00], withoutResponse: true);
-    } catch (e) {
-      debugPrint('PrinterService: BLE cut paper failed: $e');
-    }
-  }
-
-  Future<void> _printQRCodeBle(String data, {int size = 4}) async {
-    final char = await _getBleChar();
-    if (char == null) return;
-
-    try {
-      // ESC/POS: Initialize
-      await char.write([0x1B, 0x40], withoutResponse: true);
-
-      // ESC/POS: QR Code model
-      await char.write([0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00], withoutResponse: true);
-
-      // ESC/POS: QR Code size
-      await char.write([0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, size], withoutResponse: true);
-
-      // ESC/POS: QR Code error correction
-      await char.write([0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x30], withoutResponse: true);
-
-      // ESC/POS: Store QR Code data
-      final dataBytes = Uint8List.fromList(data.codeUnits);
-      final len = dataBytes.length + 3;
-      final storeCmd = [0x1D, 0x28, 0x6B, len & 0xFF, (len >> 8) & 0xFF, 0x30, 0x50, ...dataBytes];
-      await char.write(storeCmd, withoutResponse: true);
-
-      // ESC/POS: Print QR Code
-      await char.write([0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30], withoutResponse: true);
-    } catch (e) {
-      debugPrint('PrinterService: BLE QR code print failed: $e');
-    }
-  }
-
-  Future<void> _printBarcodeBle(String data) async {
-    final char = await _getBleChar();
-    if (char == null) return;
-
-    try {
-      // ESC/POS: Initialize
-      await char.write([0x1B, 0x40], withoutResponse: true);
-
-      // ESC/POS: HRI text below barcode
-      await char.write([0x1D, 0x48, 0x02], withoutResponse: true);
-
-      // ESC/POS: Barcode height
-      await char.write([0x1D, 0x68, 50], withoutResponse: true);
-
-      // ESC/POS: Print CODE128 barcode
-      final dataBytes = Uint8List.fromList(data.codeUnits);
-      final cmd = [0x1D, 0x6B, 0x49, dataBytes.length, ...dataBytes];
-      await char.write(cmd, withoutResponse: true);
-    } catch (e) {
-      debugPrint('PrinterService: BLE barcode print failed: $e');
-    }
-  }
-
-  // SPP (Serial Port Profile) helpers
+  /// Writes [data] to the RFCOMM socket in printer-sized chunks.
+  ///
+  /// Cheap thermal printers have a small input buffer; a single write larger
+  /// than that overflows it and the job is silently lost. Chunking with a short
+  /// pause between packets is the equivalent of RawBT's "delay between
+  /// packets" setting, applied automatically.
   Future<void> _sendSpp(List<int> data) async {
-    if (_sppConnection == null) throw Exception('SPP connection not available');
-    if (_sppConnection!.isConnected != true) {
-      // Attempt reconnect
-      final reconnected = await reconnectSpp();
-      if (!reconnected || _sppConnection == null) {
-        throw Exception('SPP connection lost');
-      }
+    final connection = _sppConnection;
+    if (connection == null || connection.isConnected != true) {
+      throw const _SppDisconnectedException();
     }
-    _sppConnection!.output.add(Uint8List.fromList(data));
-    await _sppConnection!.output.allSent;
+
+    if (data.isEmpty) return;
+    if (data.length <= AppConstants.sppChunkSize) {
+      connection.output.add(Uint8List.fromList(data));
+      await connection.output.allSent;
+      return;
+    }
+
+    for (
+      int offset = 0;
+      offset < data.length;
+      offset += AppConstants.sppChunkSize
+    ) {
+      // Re-check on every chunk: a printer switched off mid job must abort the
+      // transfer instead of printing a truncated receipt.
+      if (connection.isConnected != true) {
+        throw const _SppDisconnectedException();
+      }
+      final end = math.min(offset + AppConstants.sppChunkSize, data.length);
+      connection.output.add(Uint8List.fromList(data.sublist(offset, end)));
+      await connection.output.allSent;
+      await Future<void>.delayed(AppConstants.sppChunkDelay);
+    }
   }
 
-  Future<void> _printImageSpp(Uint8List bitmapData) async {
-    await _sendSpp([0x1B, 0x40]); // Initialize
-    await _sendSpp([0x1B, 0x61, 0x01]); // Center align
+  // ---------------------------------------------------------------------
+  // Status plumbing
+  // ---------------------------------------------------------------------
 
-    const int bytesPerLine = (384 + 7) ~/ 8;
-    final header = [
-      0x1D, 0x76, 0x30, 0x00,
-      bytesPerLine & 0xFF, (bytesPerLine >> 8) & 0xFF,
-      (bitmapData.length ~/ bytesPerLine) & 0xFF,
-      ((bitmapData.length ~/ bytesPerLine) >> 8) & 0xFF,
-    ];
-    await _sendSpp(header);
-    await _sendSpp(bitmapData);
-    await _sendSpp([0x1B, 0x64, 0x03]); // Feed
+  void _setStatus(PrinterConnectionStatus status) {
+    if (_status == status) return;
+    _status = status;
+    if (!_statusController.isClosed) _statusController.add(status);
   }
 
-  Future<void> _printTextSpp(String text) async {
-    await _sendSpp([0x1B, 0x40]); // Initialize
-    await _sendSpp([0x1B, 0x61, 0x00]); // Left align
-    await _sendSpp(text.codeUnits);
+  void _setTransport(PrinterTransport transport) {
+    if (_transport == transport) return;
+    _transport = transport;
+    if (!_transportController.isClosed) _transportController.add(transport);
   }
 
-  Future<void> _lineWrapSpp(int lines) async {
-    await _sendSpp([0x1B, 0x64, lines]);
-  }
-
-  Future<void> _cutPaperSpp() async {
-    await _sendSpp([0x1D, 0x56, 0x00]); // Full cut
-  }
-
-  Future<void> _printQRCodeSpp(String data, {int size = 4}) async {
-    await _sendSpp([0x1B, 0x40]); // Initialize
-    await _sendSpp([0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]); // QR model
-    await _sendSpp([0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, size]); // QR size
-    await _sendSpp([0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x30]); // Error correction
-
-    final dataBytes = Uint8List.fromList(data.codeUnits);
-    final len = dataBytes.length + 3;
-    await _sendSpp([0x1D, 0x28, 0x6B, len & 0xFF, (len >> 8) & 0xFF, 0x30, 0x50, ...dataBytes]);
-    await _sendSpp([0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30]); // Print QR
-  }
-
-  Future<void> _printBarcodeSpp(String data) async {
-    await _sendSpp([0x1B, 0x40]); // Initialize
-    await _sendSpp([0x1D, 0x48, 0x02]); // HRI below
-    await _sendSpp([0x1D, 0x68, 50]); // Height
-
-    final dataBytes = Uint8List.fromList(data.codeUnits);
-    await _sendSpp([0x1D, 0x6B, 0x49, dataBytes.length, ...dataBytes]);
-  }
+  /// Exposed for the queue screen, which disables actions mid transfer.
+  bool get isSending => _isSending;
 
   void dispose() {
+    _sppCloseWatch?.cancel();
+    _sppConnection?.dispose();
+    _sppConnection = null;
     _statusController.close();
+    _transportController.close();
+    _profileController.close();
   }
+}
+
+/// Raised internally when the RFCOMM socket disappears mid job.
+class _SppDisconnectedException implements Exception {
+  const _SppDisconnectedException();
+
+  @override
+  String toString() => 'Bluetooth connection lost';
 }

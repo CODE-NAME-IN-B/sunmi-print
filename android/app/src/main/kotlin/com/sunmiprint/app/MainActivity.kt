@@ -2,6 +2,7 @@ package com.sunmiprint.app
 
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
+import android.os.Build
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -25,6 +26,14 @@ class MainActivity : FlutterActivity() {
 
         methodChannel.setMethodCallHandler { call, result ->
             when (call.method) {
+                // The Dart side needs the API level to know which permission
+                // model applies: the BLUETOOTH_SCAN/CONNECT pair only exists
+                // from Android 12, older releases gate discovery behind a
+                // location permission instead.
+                "getSdkInt" -> {
+                    result.success(Build.VERSION.SDK_INT)
+                }
+
                 "isBluetoothEnabled" -> {
                     result.success(classicDiscovery?.isBluetoothEnabled() ?: false)
                 }

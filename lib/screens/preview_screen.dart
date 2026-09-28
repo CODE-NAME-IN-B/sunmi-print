@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
+import '../core/utils/bitmap_utils.dart';
 import '../core/utils/image_processor.dart';
 import '../core/utils/pdf_renderer.dart';
 import '../models/print_job.dart';
@@ -42,7 +43,10 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
     try {
       final file = _file;
       if (file == null || file.path == null) {
-        setState(() { _error = 'لم يتم اختيار ملف'; _isLoading = false; });
+        setState(() {
+          _error = 'لم يتم اختيار ملف';
+          _isLoading = false;
+        });
         return;
       }
 
@@ -54,15 +58,25 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
         await _generateImagePreview(file.path!, settings);
       }
     } catch (e) {
-      setState(() { _error = 'فشل المعالجة: $e'; _isLoading = false; });
+      setState(() {
+        _error = 'فشل المعالجة: $e';
+        _isLoading = false;
+      });
     }
   }
 
-  Future<void> _generateImagePreview(String path, PrinterSettings settings) async {
+  Future<void> _generateImagePreview(
+    String path,
+    PrinterSettings settings,
+  ) async {
     final file = File(path);
     final sizeBytes = await file.length();
     if (sizeBytes > 20 * 1024 * 1024) {
-      setState(() { _error = 'حجم الملف كبير جداً (${(sizeBytes / 1024 / 1024).toStringAsFixed(1)} MB). الحد الأقصى 20 MB.'; _isLoading = false; });
+      setState(() {
+        _error =
+            'حجم الملف كبير جداً (${(sizeBytes / 1024 / 1024).toStringAsFixed(1)} MB). الحد الأقصى 20 MB.';
+        _isLoading = false;
+      });
       return;
     }
     final bytes = await file.readAsBytes();
@@ -71,19 +85,36 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
       printerWidthPx: settings.pixelWidth,
       applyDithering: settings.applyDithering,
     );
-    setState(() { _previewData = processed; _isLoading = false; });
+    setState(() {
+      _previewData = processed;
+      _isLoading = false;
+    });
   }
 
-  Future<void> _generatePdfPreview(String path, PrinterSettings settings) async {
+  Future<void> _generatePdfPreview(
+    String path,
+    PrinterSettings settings,
+  ) async {
     await for (final result in PdfRenderer.renderPages(
       filePath: path,
       dpi: settings.pdfDpi,
       printerWidthPx: settings.pixelWidth,
     )) {
-      setState(() { _previewData = result.bitmapData; });
+      setState(() {
+        // `bitmapData` is packed 1-bit, which no image decoder can read. The
+        // preview has to be a real encoded image or the widget shows nothing,
+        // so it is rebuilt from the same bits the printhead will receive.
+        _previewData = unpackOneBitToPng(
+          result.bitmapData,
+          width: result.width,
+          height: result.height,
+        );
+      });
       break;
     }
-    setState(() { _isLoading = false; });
+    setState(() {
+      _isLoading = false;
+    });
   }
 
   Future<void> _print() async {
@@ -137,10 +168,15 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
                         ? const SizedBox(
                             width: 20,
                             height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
                           )
                         : const Icon(Icons.print_rounded),
-                    label: Text(_isPrinting ? 'جاري الإضافة...' : 'إضافة للطباعة'),
+                    label: Text(
+                      _isPrinting ? 'جاري الإضافة...' : 'إضافة للطباعة',
+                    ),
                   ),
                 ),
               ),
@@ -168,10 +204,18 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
                   color: const Color(0xFFEF4444).withValues(alpha: 0.1),
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(Icons.error_outline_rounded, size: 40, color: Color(0xFFEF4444)),
+                child: const Icon(
+                  Icons.error_outline_rounded,
+                  size: 40,
+                  color: Color(0xFFEF4444),
+                ),
               ),
               const SizedBox(height: 16),
-              Text(_error!, textAlign: TextAlign.center, style: theme.textTheme.bodyMedium),
+              Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium,
+              ),
               const SizedBox(height: 16),
               OutlinedButton.icon(
                 onPressed: _generatePreview,
@@ -197,7 +241,9 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
             const SizedBox(height: 16),
             Text(
               'لا توجد معاينة',
-              style: theme.textTheme.bodyLarge?.copyWith(color: colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodyLarge?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
@@ -209,7 +255,9 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
       child: Center(
         child: Container(
           decoration: BoxDecoration(
-            border: Border.all(color: colorScheme.outline.withValues(alpha: 0.3)),
+            border: Border.all(
+              color: colorScheme.outline.withValues(alpha: 0.3),
+            ),
             borderRadius: BorderRadius.circular(12),
             color: colorScheme.surface,
             boxShadow: [
@@ -224,28 +272,47 @@ class _PreviewScreenState extends ConsumerState<PreviewScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               ClipRRect(
-                borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
-                child: Image.memory(_previewData!, width: double.infinity, fit: BoxFit.contain),
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(12),
+                ),
+                child: Image.memory(
+                  _previewData!,
+                  width: double.infinity,
+                  fit: BoxFit.contain,
+                ),
               ),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFFF8FAFC),
-                  borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12)),
+                  borderRadius: const BorderRadius.vertical(
+                    bottom: Radius.circular(12),
+                  ),
                   border: Border(
-                    top: BorderSide(color: colorScheme.outline.withValues(alpha: 0.2)),
+                    top: BorderSide(
+                      color: colorScheme.outline.withValues(alpha: 0.2),
+                    ),
                   ),
                 ),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Icon(Icons.description_rounded, size: 16, color: colorScheme.onSurfaceVariant),
+                    Icon(
+                      Icons.description_rounded,
+                      size: 16,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
                     const SizedBox(width: 8),
                     Flexible(
                       child: Text(
                         _file!.name,
-                        style: theme.textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: colorScheme.onSurfaceVariant,
+                        ),
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),

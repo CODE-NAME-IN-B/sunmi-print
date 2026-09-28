@@ -7,8 +7,8 @@ import '../models/printer_settings.dart';
 
 final settingsProvider =
     StateNotifierProvider<SettingsNotifier, PrinterSettings>((ref) {
-  return SettingsNotifier();
-});
+      return SettingsNotifier();
+    });
 
 class SettingsNotifier extends StateNotifier<PrinterSettings> {
   Box<String>? _box;
@@ -31,7 +31,8 @@ class SettingsNotifier extends StateNotifier<PrinterSettings> {
       final saved = box.get('printerSettings');
       if (saved != null) {
         state = PrinterSettings.fromJson(
-            jsonDecode(saved) as Map<String, dynamic>);
+          jsonDecode(saved) as Map<String, dynamic>,
+        );
       }
       _isLoaded = true;
     } catch (e) {

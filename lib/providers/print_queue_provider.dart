@@ -10,3 +10,9 @@ final printQueueProvider = StreamProvider<List<PrintJob>>((ref) {
   final service = ref.watch(printQueueServiceProvider);
   return service.queueStream;
 });
+
+/// Live progress of the job currently being sent to the printer.
+final printProgressProvider = StreamProvider<PrintProgress?>((ref) {
+  final service = ref.watch(printQueueServiceProvider);
+  return service.progressStream;
+});

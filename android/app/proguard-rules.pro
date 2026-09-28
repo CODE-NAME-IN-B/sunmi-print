@@ -10,11 +10,11 @@
 -keepattributes Signature
 -keepattributes *Annotation*
 
-# Flutter Blue Plus
--keep class com.bosch.** { *; }
--keep class no.nordicsemi.android.** { *; }
--keep class com.lib.flutter_blue_plus.** { *; }
+# Bluetooth Classic (flutter_bluetooth_serial)
 -keep class io.flutter.plugins.** { *; }
+
+# Method channel handlers are reached reflectively from the Dart side.
+-keep class com.sunmiprint.app.**$Companion { *; }
 
 # pdf_render
 -keep class com.pdf.render.** { *; }

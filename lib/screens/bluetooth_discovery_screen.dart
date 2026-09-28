@@ -1,675 +1,566 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart' as spp;
+
+import '../core/theme/app_motion.dart';
+import '../core/theme/app_theme.dart';
+import '../models/bluetooth_device_info.dart';
+import '../providers/bluetooth_provider.dart';
+import '../providers/printer_provider.dart';
 import '../services/printer_service.dart';
+import '../widgets/pressable_scale.dart';
+import '../widgets/skeleton.dart';
 
-class ClassicBluetoothDevice {
-  final String name;
-  final String address;
-  final String type;
-  final String bondState;
-  final bool isPaired;
-
-  ClassicBluetoothDevice({
-    required this.name,
-    required this.address,
-    required this.type,
-    required this.bondState,
-    required this.isPaired,
-  });
-
-  factory ClassicBluetoothDevice.fromMap(Map<dynamic, dynamic> map) {
-    return ClassicBluetoothDevice(
-      name: map['name']?.toString() ?? 'Unknown',
-      address: map['address']?.toString() ?? '',
-      type: map['type']?.toString() ?? 'unknown',
-      bondState: map['bondState']?.toString() ?? 'none',
-      isPaired: map['isPaired'] == true,
-    );
-  }
-}
-
+/// Finds a Bluetooth Classic printer and connects to it.
+///
+/// The screen is built around the three states that actually block the user,
+/// permissions, radio off, and nothing found, each of which gets an explicit
+/// recovery action. Everything else is a list.
 class BluetoothDiscoveryScreen extends ConsumerStatefulWidget {
   const BluetoothDiscoveryScreen({super.key});
 
   @override
-  ConsumerState<BluetoothDiscoveryScreen> createState() => _BluetoothDiscoveryScreenState();
+  ConsumerState<BluetoothDiscoveryScreen> createState() =>
+      _BluetoothDiscoveryScreenState();
 }
 
-class _BluetoothDiscoveryScreenState extends ConsumerState<BluetoothDiscoveryScreen> {
-  static const _methodChannel = MethodChannel('com.sunmiprint.app/bluetooth');
-  static const _eventChannel = EventChannel('com.sunmiprint.app/bluetooth/events');
-
-  bool _isScanning = false;
-  bool _isBluetoothOn = false;
-  bool _isPairing = false;
-  final List<ClassicBluetoothDevice> _devices = [];
-  String? _error;
-  ClassicBluetoothDevice? _connectedDevice;
-  spp.BluetoothConnection? _connection;
-  StreamSubscription? _eventSubscription;
-
+class _BluetoothDiscoveryScreenState
+    extends ConsumerState<BluetoothDiscoveryScreen> {
   @override
   void initState() {
     super.initState();
-    _initBluetooth();
-  }
-
-  @override
-  void dispose() {
-    _eventSubscription?.cancel();
-    _connection = null;
-    _connectedDevice = null;
-    super.dispose();
-  }
-
-  Future<void> _initBluetooth() async {
-    try {
-      final isEnabled = await _methodChannel.invokeMethod<bool>('isBluetoothEnabled');
-      if (mounted) {
-        setState(() {
-          _isBluetoothOn = isEnabled ?? false;
-          if (!_isBluetoothOn) {
-            _error = 'يرجى تفعيل Bluetooth';
-          }
-        });
+    // Ask for permissions up front, then scan. Both are cheap and the user
+    // almost always wants both.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final notifier = ref.read(bluetoothScanProvider.notifier);
+      if (await notifier.ensurePermissions()) {
+        await notifier.startScan();
       }
-    } catch (e) {
-      debugPrint('BluetoothDiscovery: Failed to check state: $e');
-    }
-  }
-
-  Future<void> _turnOnBluetooth() async {
-    try {
-      await _methodChannel.invokeMethod('enableBluetooth');
-      // Wait a moment for Bluetooth to enable
-      await Future.delayed(const Duration(seconds: 1));
-      await _initBluetooth();
-    } catch (e) {
-      debugPrint('BluetoothDiscovery: Failed to turn on: $e');
-    }
-  }
-
-  void _listenToEvents() {
-    _eventSubscription?.cancel();
-    _eventSubscription = _eventChannel.receiveBroadcastStream().listen(
-      (dynamic event) {
-        if (!mounted) return;
-        final map = event as Map<dynamic, dynamic>;
-        final eventName = map['event']?.toString();
-
-        switch (eventName) {
-          case 'paired':
-            final devices = (map['devices'] as List<dynamic>?) ?? [];
-            setState(() {
-              for (final d in devices) {
-                final device = ClassicBluetoothDevice.fromMap(d);
-                if (!_devices.any((existing) => existing.address == device.address)) {
-                  _devices.add(device);
-                }
-              }
-            });
-            break;
-
-          case 'deviceFound':
-            final deviceMap = map['device'] as Map<dynamic, dynamic>?;
-            if (deviceMap != null) {
-              final device = ClassicBluetoothDevice.fromMap(deviceMap);
-              final alreadyExists = _devices.any((d) => d.address == device.address);
-              if (!alreadyExists) {
-                setState(() {
-                  _devices.add(device);
-                });
-              }
-            }
-            break;
-
-          case 'discoveryStarted':
-            debugPrint('BluetoothDiscovery: Discovery started');
-            break;
-
-          case 'discoveryFinished':
-            debugPrint('BluetoothDiscovery: Discovery finished');
-            if (mounted) {
-              setState(() => _isScanning = false);
-            }
-            break;
-
-          case 'bondStateChanged':
-            final address = map['address']?.toString();
-            final bondState = map['bondState']?.toString();
-            if (address != null && bondState != null) {
-              setState(() {
-                final index = _devices.indexWhere((d) => d.address == address);
-                if (index != -1) {
-                  final old = _devices[index];
-                  _devices[index] = ClassicBluetoothDevice(
-                    name: old.name,
-                    address: old.address,
-                    type: old.type,
-                    bondState: bondState,
-                    isPaired: bondState == 'bonded',
-                  );
-                }
-              });
-            }
-            break;
-        }
-      },
-      onError: (error) {
-        debugPrint('BluetoothDiscovery: Event error: $error');
-      },
-    );
-  }
-
-  Future<void> _scan() async {
-    if (_isScanning) return;
-
-    if (!_isBluetoothOn) {
-      await _turnOnBluetooth();
-      if (!_isBluetoothOn) return;
-    }
-
-    setState(() {
-      _isScanning = true;
-      _error = null;
-      _devices.clear();
     });
+  }
 
-    _listenToEvents();
-
-    try {
-      await _methodChannel.invokeMethod('startDiscovery');
-    } on PlatformException catch (e) {
-      debugPrint('BluetoothDiscovery: Platform error: $e');
-      if (mounted) {
-        String userMessage;
-        switch (e.code) {
-          case 'PERMISSION_DENIED':
-            userMessage = 'يرجى منح صلاحيات Bluetooth من إعدادات الجهاز';
-            break;
-          case 'BLUETOOTH_OFF':
-            userMessage = 'يرجى تفعيل Bluetooth';
-            _isBluetoothOn = false;
-            break;
-          case 'NO_BLUETOOTH':
-            userMessage = 'الجهاز لا يدعم Bluetooth';
-            break;
-          default:
-            userMessage = 'خطأ في Bluetooth: ${e.message}';
-        }
-        setState(() => _error = userMessage);
-      }
-    } catch (e) {
-      debugPrint('BluetoothDiscovery: Scan error: $e');
-      if (mounted) {
-        setState(() => _error = 'خطأ في البحث: $e');
-      }
+  Future<void> _retry() async {
+    final notifier = ref.read(bluetoothScanProvider.notifier);
+    notifier.clearError();
+    if (await notifier.ensurePermissions()) {
+      await notifier.startScan();
     }
   }
 
-  Future<bool> _pairDevice(ClassicBluetoothDevice device) async {
-    if (device.isPaired) return true;
+  Future<void> _connect(BluetoothDeviceInfo device) async {
+    HapticFeedback.selectionClick();
+    final result = await ref
+        .read(bluetoothScanProvider.notifier)
+        .connect(device);
+    if (!mounted) return;
 
-    try {
-      setState(() {
-        _error = null;
-        _isPairing = true;
-      });
-      final result = await _methodChannel.invokeMethod<bool>('pairDevice', {
-        'address': device.address,
-      });
-      return result ?? false;
-    } catch (e) {
-      debugPrint('BluetoothDiscovery: Pairing failed: $e');
-      if (mounted) {
-        String errorMsg = e.toString();
-        if (errorMsg.contains('BOND_FAILED') || errorMsg.contains('Pairing failed')) {
-          errorMsg = 'فشل الاقتران - يرجى المحاولة مرة أخرى';
-        }
-        setState(() => _error = 'خطأ في الاقتران: $errorMsg');
-      }
-      return false;
-    } finally {
-      if (mounted) {
-        setState(() => _isPairing = false);
-      }
-    }
-  }
-
-  Future<void> _connectToDevice(ClassicBluetoothDevice device) async {
-    try {
-      setState(() => _error = null);
-
-      // Cancel any ongoing discovery before connecting (RFCOMM requires this)
-      try {
-        await _methodChannel.invokeMethod('cancelDiscovery');
-      } catch (_) {}
-
-      // Pair/bond the device first if not already paired
-      if (!device.isPaired) {
-        final paired = await _pairDevice(device);
-        if (!paired) {
-          if (mounted) {
-            setState(() => _error = 'يرجى الاقتران بالطابعة أولاً');
-          }
-          return;
-        }
-
-        // Update device bond state in list
-        if (mounted) {
-          final index = _devices.indexWhere((d) => d.address == device.address);
-          if (index != -1) {
-            final old = _devices[index];
-            _devices[index] = ClassicBluetoothDevice(
-              name: old.name,
-              address: old.address,
-              type: old.type,
-              bondState: 'bonded',
-              isPaired: true,
-            );
-          }
-        }
-      }
-
-      if (mounted) {
-        setState(() => _error = null);
-      }
-
-      final connection = await spp.BluetoothConnection.toAddress(device.address);
-
-      // Clean up old connection via PrinterService
-      if (_connection != null) {
-        PrinterService.instance.clearSppConnection();
-      }
-
-      _connection = connection;
-      _connectedDevice = device;
-
-      PrinterService.instance.setSppConnection(connection, device.name, address: device.address);
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('تم الاتصال بـ ${device.name}'),
-            backgroundColor: const Color(0xFF10B981),
-            action: SnackBarAction(
-              label: 'قطع الاتصال',
-              textColor: Colors.white,
-              onPressed: () => _disconnectDevice(),
-            ),
+    final messenger = ScaffoldMessenger.of(context);
+    if (result.success) {
+      final transport = ref.read(printerServiceProvider).transport;
+      HapticFeedback.mediumImpact();
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            'تم الاتصال بـ ${device.name} عبر ${transport == PrinterTransport.sunmiSdk ? 'الطابعة المدمجة' : 'بلوتوث كلاسيكي'}',
           ),
-        );
-        setState(() {});
-      }
-    } catch (e) {
-      debugPrint('BluetoothDiscovery: Connection failed: $e');
-      if (mounted) {
-        String errorMsg = e.toString();
-        if (errorMsg.contains('connect_error') || errorMsg.contains('socket might closed')) {
-          errorMsg = 'فشل الاتصال - تأكد أن الطابعة مدعومة وقريبة';
-        } else if (errorMsg.contains('read failed')) {
-          errorMsg = 'فشل الاتصال - تأكد أن الطابعة تعمل وقريبة من الجهاز';
-        }
-        setState(() => _error = 'فشل الاتصال: $errorMsg');
-      }
-    }
-  }
-
-  Future<void> _disconnectDevice() async {
-    try {
-      _connection = null;
-      _connectedDevice = null;
-      PrinterService.instance.clearSppConnection();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('تم قطع الاتصال'),
-            backgroundColor: Color(0xFF64748B),
+          backgroundColor: AppTheme.success,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+      await Navigator.of(context).maybePop();
+    } else {
+      HapticFeedback.heavyImpact();
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('فشل الاتصال: ${result.messageAr}'),
+          backgroundColor: AppTheme.error,
+          duration: const Duration(seconds: 5),
+          action: SnackBarAction(
+            label: 'إعادة المحاولة',
+            textColor: Colors.white,
+            onPressed: () => _connect(device),
           ),
-        );
-        setState(() {});
-      }
-    } catch (e) {
-      debugPrint('BluetoothDiscovery: Disconnect failed: $e');
-    }
-  }
-
-  String _bondStateLabel(String bondState) {
-    switch (bondState) {
-      case 'bonded':
-        return 'مقترن';
-      case 'bonding':
-        return 'يتم الاقتران';
-      case 'none':
-        return 'غير مقترن';
-      default:
-        return '';
-    }
-  }
-
-  Color _bondStateColor(String bondState) {
-    switch (bondState) {
-      case 'bonded':
-        return const Color(0xFF10B981);
-      case 'bonding':
-        return const Color(0xFFF97316);
-      default:
-        return const Color(0xFF64748B);
+        ),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
+    final state = ref.watch(bluetoothScanProvider);
+    final notifier = ref.read(bluetoothScanProvider.notifier);
+    final isConnected =
+        ref.watch(printerStatusProvider).valueOrNull ==
+        PrinterConnectionStatus.connected;
+    final connectedAddress = isConnected
+        ? PrinterService.instance.deviceAddress
+        : state.connectedAddress;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('البحث عن طابعة'),
-        actions: [
-          if (_isScanning)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFF97316)),
-              ),
-            )
-          else ...[
-            if (_connectedDevice != null)
-              IconButton(
-                icon: const Icon(Icons.bluetooth_connected, color: Color(0xFF10B981)),
-                tooltip: 'قطع الاتصال',
-                onPressed: _disconnectDevice,
-              ),
-            IconButton(
-              icon: const Icon(Icons.search_rounded),
-              tooltip: 'بحث',
-              onPressed: _scan,
-            ),
-          ],
+        actions: <Widget>[
+          AnimatedSwitcher(
+            duration: AppMotion.base,
+            child: state.isScanning
+                ? IconButton(
+                    key: const ValueKey<String>('cancel'),
+                    icon: const Icon(Icons.stop_rounded),
+                    tooltip: 'إيقاف البحث',
+                    onPressed: notifier.cancelScan,
+                  )
+                : IconButton(
+                    key: const ValueKey<String>('scan'),
+                    icon: const Icon(Icons.refresh_rounded),
+                    tooltip: 'بحث جديد',
+                    onPressed: _retry,
+                  ),
+          ),
+          const SizedBox(width: 4),
         ],
       ),
       body: Column(
-        children: [
-          // Bluetooth status card
-          Container(
-            margin: const EdgeInsets.all(16),
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF97316).withAlpha(15),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: const Color(0xFFF97316).withAlpha(40)),
+        children: <Widget>[
+          if (state.hasBlockingProblem)
+            _BlockingNotice(
+              state: state,
+              onRetry: _retry,
+              onAction: () async {
+                if (state.stage == BluetoothScanStage.permissionDenied) {
+                  await notifier.openAppSettings();
+                } else if (state.stage == BluetoothScanStage.bluetoothOff) {
+                  await notifier.openBluetoothSettings();
+                } else {
+                  await _retry();
+                }
+              },
             ),
-            child: Row(
-              children: [
-                Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: _isBluetoothOn
-                        ? const Color(0xFF10B981).withAlpha(30)
-                        : const Color(0xFFEF4444).withAlpha(30),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Icon(
-                    _isBluetoothOn ? Icons.bluetooth_rounded : Icons.bluetooth_disabled_rounded,
-                    color: _isBluetoothOn ? const Color(0xFF10B981) : const Color(0xFFEF4444),
-                    size: 24,
+          if (state.isScanning) _ScanProgress(state: state),
+          Expanded(child: _buildBody(context, state, connectedAddress)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBody(
+    BuildContext context,
+    BluetoothScanState state,
+    String? connectedAddress,
+  ) {
+    if (state.stage == BluetoothScanStage.initial ||
+        state.stage == BluetoothScanStage.checkingPermissions) {
+      return const SkeletonDeviceList();
+    }
+
+    if (state.devices.isEmpty) {
+      return _EmptyState(
+        scanning: state.isScanning,
+        blocked: state.hasBlockingProblem,
+        onScan: _retry,
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _retry,
+      child: ListView.separated(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        itemCount: state.devices.length + 1,
+        separatorBuilder: (_, __) => const SizedBox(height: 10),
+        itemBuilder: (context, index) {
+          if (index == 0) {
+            return _DeviceCountHeader(
+              count: state.devices.length,
+              scanning: state.isScanning,
+            );
+          }
+          final device = state.devices[index - 1];
+          return _DeviceTile(
+            device: device,
+            isConnected: device.address == connectedAddress,
+            isConnecting:
+                state.isConnecting && state.pendingAddress == device.address,
+            connectProgress:
+                state.connectAttemptsTotal > 0 &&
+                    state.pendingAddress == device.address
+                ? state.connectAttempts
+                : 0,
+            onTap: state.isConnecting || state.isScanning
+                ? null
+                : () => _connect(device),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _BlockingNotice extends StatelessWidget {
+  const _BlockingNotice({
+    required this.state,
+    required this.onRetry,
+    required this.onAction,
+  });
+
+  final BluetoothScanState state;
+  final Future<void> Function() onRetry;
+  final VoidCallback onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+
+    final (icon, title, action) = switch (state.stage) {
+      BluetoothScanStage.permissionDenied => (
+        Icons.lock_person_rounded,
+        'صلاحية البلوتوث مرفوضة',
+        'فتح الإعدادات',
+      ),
+      BluetoothScanStage.bluetoothOff => (
+        Icons.bluetooth_disabled_rounded,
+        'البلوتوث غير مفعّل',
+        'تفعيل البلوتوث',
+      ),
+      _ => (
+        Icons.error_outline_rounded,
+        'تعذّر البحث عن الأجهزة',
+        'إعادة المحاولة',
+      ),
+    };
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: scheme.errorContainer.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(AppRadii.control),
+        border: Border.all(color: scheme.error.withValues(alpha: 0.35)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(icon, color: AppTheme.error, size: 22),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  title,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    color: scheme.onSurface,
                   ),
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _isBluetoothOn ? 'Bluetooth مفعل' : 'Bluetooth مطفأ',
-                        style: theme.textTheme.titleSmall?.copyWith(
-                          color: _isBluetoothOn ? const Color(0xFF10B981) : const Color(0xFFEF4444),
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        _connectedDevice != null
-                            ? 'متصل بـ ${_connectedDevice!.name}'
-                            : 'تأكد من تشغيل Bluetooth على جهازك',
-                        style: theme.textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
-                      ),
-                    ],
-                  ),
-                ),
-                if (!_isBluetoothOn)
-                  FilledButton.tonal(
-                    onPressed: _turnOnBluetooth,
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFFF97316).withAlpha(25),
-                      foregroundColor: const Color(0xFFF97316),
+                if (state.lastError != null) ...<Widget>[
+                  const SizedBox(height: 2),
+                  Text(
+                    state.lastError!,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
                     ),
-                    child: const Text('تفعيل'),
                   ),
-                if (_connectedDevice != null)
-                  IconButton(
-                    icon: const Icon(Icons.close_rounded, size: 20),
-                    color: colorScheme.onSurfaceVariant,
-                    onPressed: _disconnectDevice,
-                  ),
+                ],
               ],
             ),
           ),
-
-          // Error message
-          if (_error != null && !_isPairing)
-            Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16),
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xFFEF4444).withAlpha(20),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFEF4444).withAlpha(50)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.error_outline, color: Color(0xFFEF4444), size: 20),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      _error!,
-                      style: const TextStyle(color: Color(0xFFEF4444), fontSize: 13),
-                    ),
-                  ),
-                ],
-              ),
+          const SizedBox(width: 8),
+          FilledButton.tonal(
+            onPressed: onAction,
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, 40),
+              padding: const EdgeInsets.symmetric(horizontal: 14),
             ),
-
-          // Pairing loading indicator
-          if (_isPairing)
-            Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16),
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xFFF97316).withAlpha(15),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFF97316).withAlpha(40)),
-              ),
-              child: const Row(
-                children: [
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFF97316)),
-                  ),
-                  SizedBox(width: 12),
-                  Text(
-                    'جاري الاقتران بالطابعة...',
-                    style: TextStyle(color: Color(0xFFF97316), fontSize: 13),
-                  ),
-                ],
-              ),
-            ),
-
-          // Device count
-          if (_devices.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                children: [
-                  Text(
-                    'الأجهزة المكتشفة (${_devices.length})',
-                    style: theme.textTheme.labelMedium?.copyWith(color: colorScheme.onSurfaceVariant),
-                  ),
-                  const Spacer(),
-                  if (_isScanning)
-                    const SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFF97316)),
-                    ),
-                ],
-              ),
-            ),
-
-          const SizedBox(height: 8),
-
-          // Device list
-          Expanded(
-            child: _devices.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Container(
-                          width: 80,
-                          height: 80,
-                          decoration: BoxDecoration(
-                            color: colorScheme.onSurfaceVariant.withAlpha(20),
-                            shape: BoxShape.circle,
-                          ),
-                          child: Icon(
-                            _isScanning ? Icons.bluetooth_searching_rounded : Icons.bluetooth_disabled_rounded,
-                            size: 40,
-                            color: colorScheme.onSurfaceVariant.withAlpha(100),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          _isScanning ? 'جاري البحث...' : 'لا توجد أجهزة',
-                          style: theme.textTheme.titleMedium?.copyWith(color: colorScheme.onSurfaceVariant),
-                        ),
-                        const SizedBox(height: 8),
-                        if (!_isScanning)
-                          FilledButton.tonalIcon(
-                            onPressed: _scan,
-                            icon: const Icon(Icons.search_rounded),
-                            label: const Text('بدء البحث'),
-                            style: FilledButton.styleFrom(
-                              backgroundColor: const Color(0xFFF97316).withAlpha(25),
-                              foregroundColor: const Color(0xFFF97316),
-                            ),
-                          ),
-                      ],
-                    ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    itemCount: _devices.length,
-                    itemBuilder: (context, index) {
-                      final device = _devices[index];
-                      final isConnected = _connectedDevice?.address == device.address;
-                      final bondColor = _bondStateColor(device.bondState);
-                      final bondLabel = _bondStateLabel(device.bondState);
-
-                      return Card(
-                        margin: const EdgeInsets.only(bottom: 8),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          side: BorderSide(
-                            color: isConnected
-                                ? const Color(0xFF10B981).withAlpha(128)
-                                : colorScheme.outline.withAlpha(50),
-                          ),
-                        ),
-                        child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                          leading: Container(
-                            width: 44,
-                            height: 44,
-                            decoration: BoxDecoration(
-                              color: isConnected
-                                  ? const Color(0xFF10B981).withAlpha(30)
-                                  : const Color(0xFFF97316).withAlpha(25),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Icon(
-                              Icons.print_rounded,
-                              color: isConnected ? const Color(0xFF10B981) : const Color(0xFFF97316),
-                            ),
-                          ),
-                          title: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  device.name,
-                                  style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
-                                ),
-                              ),
-                              if (bondLabel.isNotEmpty)
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: bondColor.withAlpha(25),
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: Text(
-                                    bondLabel,
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: bondColor,
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          ),
-                          subtitle: Text(
-                            device.address,
-                            style: theme.textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
-                          ),
-                          trailing: isConnected
-                              ? const Icon(Icons.check_circle, color: Color(0xFF10B981), size: 24)
-                              : _isPairing
-                                  ? const SizedBox(
-                                      width: 24,
-                                      height: 24,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: Color(0xFFF97316),
-                                      ),
-                                    )
-                                  : FilledButton(
-                                      onPressed: () => _connectToDevice(device),
-                                      style: FilledButton.styleFrom(
-                                        minimumSize: const Size(80, 36),
-                                        padding: const EdgeInsets.symmetric(horizontal: 12),
-                                        backgroundColor: const Color(0xFFF97316),
-                                        foregroundColor: Colors.white,
-                                      ),
-                                      child: Text(
-                                        device.isPaired ? 'اتصال' : 'اقتران واتصال',
-                                        style: const TextStyle(fontSize: 12),
-                                      ),
-                                    ),
-                        ),
-                      );
-                    },
-                  ),
+            child: Text(action),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ScanProgress extends StatelessWidget {
+  const _ScanProgress({required this.state});
+
+  final BluetoothScanState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+      child: Row(
+        children: <Widget>[
+          const SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            'جارٍ البحث عن الأجهزة القريبة…',
+            style: theme.textTheme.bodySmall,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DeviceCountHeader extends StatelessWidget {
+  const _DeviceCountHeader({required this.count, required this.scanning});
+
+  final int count;
+  final bool scanning;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4, top: 4),
+      child: Row(
+        children: <Widget>[
+          Text(
+            'الأجهزة ($count)',
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const Spacer(),
+          if (scanning)
+            Text(
+              'يتم التحديث تلقائياً',
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DeviceTile extends StatelessWidget {
+  const _DeviceTile({
+    required this.device,
+    required this.isConnected,
+    required this.isConnecting,
+    required this.connectProgress,
+    required this.onTap,
+  });
+
+  final BluetoothDeviceInfo device;
+  final bool isConnected;
+  final bool isConnecting;
+  final int connectProgress;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final enabled = onTap != null;
+
+    final (icon, tint) = isConnected
+        ? (Icons.print_rounded, AppTheme.success)
+        : device.supportsClassic
+        ? (Icons.bluetooth_rounded, scheme.primary)
+        : (Icons.bluetooth_audio_rounded, scheme.onSurfaceVariant);
+
+    return PressableScale(
+      onTap: onTap,
+      enabled: enabled,
+      semanticLabel: 'Connect to ${device.name}',
+      child: AnimatedContainer(
+        duration: AppMotion.base,
+        curve: AppMotion.curve,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: isConnected
+              ? AppTheme.success.withValues(alpha: 0.06)
+              : scheme.surface,
+          borderRadius: BorderRadius.circular(AppRadii.card),
+          border: Border.all(
+            color: isConnected ? AppTheme.success : scheme.outlineVariant,
+            width: isConnected ? 1.6 : 1,
+          ),
+        ),
+        child: Row(
+          children: <Widget>[
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: tint.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(AppRadii.control),
+              ),
+              child: Icon(icon, color: tint, size: 22),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    device.hasRealName ? device.name : 'جهاز غير مسمى',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: <Widget>[
+                      Text(
+                        device.address,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                      if (device.isPaired) ...<Widget>[
+                        const SizedBox(width: 6),
+                        const _Tag(label: 'مقترنة', color: AppTheme.success),
+                      ] else if (!device.supportsClassic) ...<Widget>[
+                        const SizedBox(width: 6),
+                        const _Tag(
+                          label: 'Bluetooth LE',
+                          color: AppTheme.warning,
+                        ),
+                      ],
+                    ],
+                  ),
+                  if (isConnecting && connectProgress > 0) ...<Widget>[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: <Widget>[
+                        Expanded(
+                          child: LinearProgressIndicator(
+                            value: connectProgress == 0
+                                ? null
+                                : connectProgress / 3,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'محاولة $connectProgress/3',
+                          style: theme.textTheme.labelSmall,
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
+            if (isConnected)
+              const Icon(
+                Icons.check_circle_rounded,
+                color: AppTheme.success,
+                size: 26,
+              )
+            else if (isConnecting)
+              const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            else
+              Icon(
+                Icons.chevron_left_rounded,
+                color: enabled ? scheme.primary : scheme.outline,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Tag extends StatelessWidget {
+  const _Tag({required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(AppRadii.chip),
+      ),
+      child: Text(
+        label,
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+          color: color,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({
+    required this.scanning,
+    required this.blocked,
+    required this.onScan,
+  });
+
+  final bool scanning;
+  final bool blocked;
+  final Future<void> Function() onScan;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Container(
+              width: 88,
+              height: 88,
+              decoration: BoxDecoration(
+                color: scheme.onSurfaceVariant.withValues(alpha: 0.08),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                scanning
+                    ? Icons.bluetooth_searching_rounded
+                    : Icons.print_disabled_rounded,
+                size: 40,
+                color: scheme.onSurfaceVariant.withValues(alpha: 0.6),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Text(
+              scanning ? 'جارٍ البحث…' : 'لم يتم العثور على أجهزة',
+              style: theme.textTheme.titleMedium,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              blocked
+                  ? 'عالج المشكلة أعلاه ثم أعد المحاولة.'
+                  : 'شغّل الطابعة، اجعلها قريبة، ثم ابدأ البحث مرة أخرى.',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 20),
+            if (!scanning)
+              FilledButton.icon(
+                onPressed: onScan,
+                icon: const Icon(Icons.search_rounded, size: 18),
+                label: const Text('بدء البحث'),
+              ),
+          ],
+        ),
       ),
     );
   }

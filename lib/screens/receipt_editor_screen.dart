@@ -1,15 +1,20 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:sunmi_printer_plus/sunmi_printer_plus.dart';
+import '../core/theme/app_motion.dart';
+import '../core/theme/app_theme.dart';
+import '../models/receipt_document.dart';
 import '../services/printer_service.dart';
 import '../providers/printer_provider.dart';
 import '../providers/settings_provider.dart';
+import '../widgets/pressable_scale.dart';
 
 class ReceiptEditorScreen extends ConsumerStatefulWidget {
   const ReceiptEditorScreen({super.key});
 
   @override
-  ConsumerState<ReceiptEditorScreen> createState() => _ReceiptEditorScreenState();
+  ConsumerState<ReceiptEditorScreen> createState() =>
+      _ReceiptEditorScreenState();
 }
 
 class _ReceiptEditorScreenState extends ConsumerState<ReceiptEditorScreen> {
@@ -29,64 +34,67 @@ class _ReceiptEditorScreenState extends ConsumerState<ReceiptEditorScreen> {
     super.dispose();
   }
 
-  int _getSeparatorLength() {
-    final settings = ref.read(settingsProvider);
-    return settings.printerWidth == 'mm80' ? 48 : 32;
+  /// Builds the printable document from the form fields.
+  ///
+  /// Everything goes through [ReceiptDocument] rather than a sequence of
+  /// print calls so the whole receipt is laid out and rasterised at the
+  /// configured paper width in one pass. That is what keeps Arabic shaping and
+  /// right-to-left order correct: the Flutter text engine lays the line out,
+  /// and the printer only ever receives finished dots.
+  ReceiptDocument _buildDocument() {
+    final body = _bodyController.text.trim();
+    final store = _storeNameController.text.trim();
+    final footer = _footerController.text.trim();
+    final qr = _includeQR ? _qrUrlController.text.trim() : '';
+
+    return ReceiptDocument(
+      header: store,
+      subHeader: store.isEmpty ? null : null,
+      lines: <ReceiptLine>[
+        if (store.isNotEmpty) const ReceiptLine.rule(ReceiptRule.solid),
+        if (body.isNotEmpty) ReceiptLine.text(body, align: ReceiptAlign.start),
+      ],
+      footer: footer.isEmpty ? null : footer,
+      qrData: qr.isEmpty ? null : qr,
+    );
   }
 
   Future<void> _print() async {
-    setState(() => _isPrinting = true);
-    try {
-      final printer = PrinterService.instance;
-      final separator = '─' * _getSeparatorLength();
-
-      if (_storeNameController.text.isNotEmpty) {
-        if (!await printer.printText(_storeNameController.text, align: SunmiPrintAlign.CENTER)) {
-          throw Exception('فشل طباعة اسم المتجر');
-        }
-        if (!await printer.printText(separator, align: SunmiPrintAlign.CENTER)) {
-          throw Exception('فشل طباعة الفاصل');
-        }
-      }
-
-      await printer.lineWrap(1);
-      if (!await printer.printText(_bodyController.text, align: SunmiPrintAlign.RIGHT)) {
-        throw Exception('فشل طباعة نص الإيصال');
-      }
-      await printer.lineWrap(1);
-
-      if (_footerController.text.isNotEmpty) {
-        if (!await printer.printText(_footerController.text, align: SunmiPrintAlign.CENTER)) {
-          throw Exception('failure printing footer');
-        }
-      }
-
-      if (_includeQR && _qrUrlController.text.isNotEmpty) {
-        await printer.lineWrap(1);
-        if (!await printer.printQRCode(_qrUrlController.text, size: 5)) {
-          throw Exception('failure printing QR code');
-        }
-      }
-
-      await printer.lineWrap(3);
-      if (!await printer.cutPaper()) {
-        throw Exception('failure cutting paper');
-      }
-
-      if (!mounted) return;
+    final document = _buildDocument();
+    if (document.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تمت طباعة الإيصال بنجاح')),
+        const SnackBar(content: Text('الإيصال فارغ. أدخل المحتوى أولاً.')),
       );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
+      return;
+    }
+
+    setState(() => _isPrinting = true);
+    final messenger = ScaffoldMessenger.of(context);
+    final settings = ref.read(settingsProvider);
+
+    final ok = await ref
+        .read(printerServiceProvider)
+        .printReceipt(document, settings: settings, copies: settings.copies);
+
+    if (!mounted) return;
+    setState(() => _isPrinting = false);
+
+    if (ok) {
+      HapticFeedback.mediumImpact();
+      messenger.showSnackBar(
         SnackBar(
-          content: Text('فشلت الطباعة: $e'),
-          backgroundColor: const Color(0xFFEF4444),
+          content: Text('تمت طباعة الإيصال · ${settings.pixelWidth} بكسل'),
+          backgroundColor: AppTheme.success,
         ),
       );
-    } finally {
-      setState(() => _isPrinting = false);
+    } else {
+      HapticFeedback.heavyImpact();
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('فشلت الطباعة. تحقق من الورق واتصال الطابعة.'),
+          backgroundColor: AppTheme.error,
+        ),
+      );
     }
   }
 
@@ -131,20 +139,30 @@ class _ReceiptEditorScreenState extends ConsumerState<ReceiptEditorScreen> {
                   const SizedBox(height: 16),
                   TextField(
                     controller: _storeNameController,
-                    decoration: const InputDecoration(labelText: 'اسم المتجر', hintText: 'أدخل اسم المتجر'),
+                    decoration: const InputDecoration(
+                      labelText: 'اسم المتجر',
+                      hintText: 'أدخل اسم المتجر',
+                    ),
                     textAlign: TextAlign.right,
                   ),
                   const SizedBox(height: 12),
                   TextField(
                     controller: _bodyController,
-                    decoration: const InputDecoration(labelText: 'نص الإيصال', hintText: 'محتوى الإيصال...'),
+                    decoration: const InputDecoration(
+                      labelText: 'نص الإيصال',
+                      hintText: 'اكتب الأصناف والأسعار…',
+                      alignLabelWithHint: true,
+                    ),
                     maxLines: 6,
-                    textAlign: TextAlign.right,
+                    minLines: 3,
                   ),
                   const SizedBox(height: 12),
                   TextField(
                     controller: _footerController,
-                    decoration: const InputDecoration(labelText: 'تذييل', hintText: 'شكراً لتعاملكم...'),
+                    decoration: const InputDecoration(
+                      labelText: 'تذييل',
+                      hintText: 'شكراً لتعاملكم...',
+                    ),
                     textAlign: TextAlign.right,
                   ),
                 ],
@@ -180,41 +198,62 @@ class _ReceiptEditorScreenState extends ConsumerState<ReceiptEditorScreen> {
             ),
           ),
           const SizedBox(height: 24),
-          SizedBox(
-            height: 52,
-            child: FilledButton.icon(
-              onPressed: (_isPrinting || !canPrint) ? null : _print,
-              icon: _isPrinting
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                    )
-                  : const Icon(Icons.print_rounded),
-              label: Text(_isPrinting ? 'جاري الطباعة...' : 'طباعة الإيصال'),
+          PressableScale(
+            onTap: (_isPrinting || !canPrint) ? null : _print,
+            enabled: !_isPrinting && canPrint,
+            child: SizedBox(
+              height: AppSizes.touchTarget + 4,
+              child: FilledButton.icon(
+                onPressed: (_isPrinting || !canPrint) ? null : _print,
+                icon: _isPrinting
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Icon(Icons.print_rounded, size: 20),
+                label: Text(_isPrinting ? 'جارٍ الطباعة…' : 'طباعة الإيصال'),
+              ),
             ),
           ),
           if (!canPrint)
             Padding(
               padding: const EdgeInsets.only(top: 12),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSizes.gutter,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFEF4444).withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: const Color(0xFFEF4444).withValues(alpha: 0.2)),
+                  color: colorScheme.error.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(AppRadii.control),
+                  border: Border.all(
+                    color: colorScheme.error.withValues(alpha: 0.25),
+                  ),
                 ),
                 child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.link_off_rounded, color: Color(0xFFEF4444), size: 18),
-                    const SizedBox(width: 8),
-                    Text(
-                      'الطابعة غير متصلة - قم بتوصيل الطابعة أولاً',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: const Color(0xFFEF4444),
-                        fontWeight: FontWeight.w500,
+                  children: <Widget>[
+                    Icon(
+                      Icons.link_off_rounded,
+                      color: colorScheme.error,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'الطابعة غير متصلة',
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          color: colorScheme.error,
+                        ),
                       ),
+                    ),
+                    TextButton(
+                      onPressed: () =>
+                          Navigator.of(context).pushNamed<void>('/bluetooth'),
+                      child: const Text('اتصال'),
                     ),
                   ],
                 ),

@@ -8,7 +8,13 @@ allprojects {
 
 rootProject.buildDir = '../build'
 
-allprojects {
+// `subprojects`, not `allprojects`. `allprojects` also matches the root
+// project, which would append its own name to its build directory and leave
+// the root at build/android. Every subproject then inherits that as
+// rootProject.buildDir, so the app module lands in build/android/app instead of
+// build/app, and the flutter tool, which looks in build/app/outputs/flutter-apk,
+// reports that Gradle produced no APK even though it did.
+subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
 }
 

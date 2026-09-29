@@ -90,6 +90,16 @@ print(" ".join(json.load(open(sys.argv[1]))[sys.argv[2]].get("remove_paths", [])
     rm -rf "${vendored:?}/$path"
   done
 
+  # Compiling a vendored plugin writes its intermediates in place, so the tree
+  # is not byte-for-byte clean between builds. Ignore those paths rather than
+  # deleting them, so the next build stays incremental.
+  for path in $(python3 -c '
+import json, sys
+print(" ".join(json.load(open(sys.argv[1]))[sys.argv[2]].get("ignore_paths", [])))
+' "$manifest" "$package"); do
+    rm -rf "${published:?}/$path" "${vendored:?}/$path"
+  done
+
   if ! python3 - "$manifest" "$package" "$published" "$vendored" <<'PY'
 import json, os, subprocess, sys
 

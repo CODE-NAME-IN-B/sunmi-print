@@ -85,6 +85,42 @@ jobs:
           # The updater in the app fetches an asset with this exact name.
           cp "$apk" dist/app-release.apk
 
+      # A debug-signed build installs and runs, so nothing downstream complains
+      # about it. But it cannot be replaced by a release-signed one later
+      # without uninstalling first, and it is not distributable. Say which one
+      # this is rather than letting it be discovered by a user.
+      - name: Report how the APK is signed
+        run: |
+          set -euo pipefail
+          apksigner=$(command -v apksigner || true)
+          if [ -z "$apksigner" ] && [ -n "${ANDROID_SDK_ROOT:-}" ]; then
+            apksigner=$(ls -1 "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          fi
+          if [ -z "$apksigner" ]; then
+            echo "::warning::apksigner was not found, so the signing identity is unknown"
+            exit 0
+          fi
+
+          if ! "$apksigner" verify --print-certs dist/app-release.apk > /tmp/certs 2>/tmp/certs.err; then
+            echo "::error::The APK signature does not verify"
+            cat /tmp/certs.err
+            exit 1
+          fi
+
+          signer=$(sed -n 's/^Signer #1 certificate DN: //p' /tmp/certs)
+          case "$signer" in
+            *"CN=Android Debug"*)
+              echo "::warning::This APK is signed with the DEBUG certificate, because no KEYSTORE_* secrets are configured. It installs and runs, but it cannot be upgraded in place by a release-signed build, and it is not suitable for distribution."
+              ;;
+            "")
+              echo "::error::The APK verified but reported no signer"
+              exit 1
+              ;;
+            *)
+              echo "Signed with a release certificate: $signer"
+              ;;
+          esac
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

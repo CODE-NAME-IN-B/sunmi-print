@@ -92,34 +92,43 @@ jobs:
       - name: Report how the APK is signed
         run: |
           set -euo pipefail
-          apksigner=$(command -v apksigner || true)
-          if [ -z "$apksigner" ] && [ -n "${ANDROID_SDK_ROOT:-}" ]; then
-            apksigner=$(ls -1 "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+
+          # Integrity gates the job. Identifying the signer only reports, because
+          # apksigner's wording varies between build-tools versions and a job
+          # must not fail because a label was renamed.
+          if command -v apksigner >/dev/null 2>&1; then
+            tool=apksigner
+          else
+            # `|| true`, because set -e with pipefail would otherwise abort the
+            # step here, on exactly the "no apksigner" path that is meant to
+            # carry on.
+            tool=$(ls -1 "${ANDROID_SDK_ROOT:-/nonexistent}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
           fi
-          if [ -z "$apksigner" ]; then
-            echo "::warning::apksigner was not found, so the signing identity is unknown"
+
+          if [ -z "$tool" ]; then
+            echo "::warning::apksigner was not found, so the signing identity was not checked"
             exit 0
           fi
 
-          if ! "$apksigner" verify --print-certs dist/app-release.apk > /tmp/certs 2>/tmp/certs.err; then
+          if ! "$tool" verify --print-certs dist/app-release.apk > /tmp/certs 2>&1; then
             echo "::error::The APK signature does not verify"
-            cat /tmp/certs.err
+            cat /tmp/certs
             exit 1
           fi
 
-          signer=$(sed -n 's/^Signer #1 certificate DN: //p' /tmp/certs)
-          case "$signer" in
-            *"CN=Android Debug"*)
-              echo "::warning::This APK is signed with the DEBUG certificate, because no KEYSTORE_* secrets are configured. It installs and runs, but it cannot be upgraded in place by a release-signed build, and it is not suitable for distribution."
-              ;;
-            "")
-              echo "::error::The APK verified but reported no signer"
-              exit 1
-              ;;
-            *)
-              echo "Signed with a release certificate: $signer"
-              ;;
-          esac
+          {
+            echo '--- apksigner verify --print-certs ---'
+            cat /tmp/certs
+            echo '--- end ---'
+          }
+
+          if grep -q 'CN=Android Debug' /tmp/certs; then
+            echo "::warning::This APK is signed with the DEBUG certificate, because no KEYSTORE_* secrets are configured. It installs and runs, but it cannot be upgraded in place by a release-signed build, and it is not suitable for distribution."
+          elif grep -qiE 'certificate (dn|sha-256)' /tmp/certs; then
+            echo "Signed with a release certificate."
+          else
+            echo "::warning::The signature verified but no certificate was reported. The identity is unknown."
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
